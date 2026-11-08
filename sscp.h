@@ -231,7 +231,8 @@ struct sscp_stream {
     uint32_t pacing_gain_q16;
     uint32_t pacing_mark_seq;
     uint32_t pacing_w_start;
-    uint64_t pacing_round_work;
+    uint64_t pacing_round_start_time;
+    uint64_t pacing_round_end_time;
     uint32_t pacing_round_pkts;
     uint8_t  pacing_round_active;
 };

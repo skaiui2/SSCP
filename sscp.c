@@ -1096,20 +1096,6 @@ static inline int sscp_sack_gap_valid(struct sscp_stream *ss,
  */
 #include <math.h>
 
-static inline uint32_t sscp_calc_c_q16(uint32_t w0, uint32_t w1, uint32_t N)
-{
-    if (w0 == 0) w0 = 1;
-    if (w1 <= w0) {
-        return (N > 0 && w0 > 0) ? (uint32_t)(((uint64_t)N * 65536ULL) / w0) : 65536U;
-    }
-    double dw = (double)(w1 - w0);
-    double ratio = (double)w1 / (double)w0;
-    double c_val = (double)N * log(ratio) / dw;
-    if (c_val < 0.5) c_val = 0.5;
-    if (c_val > 2.5) c_val = 2.5;
-    return (uint32_t)(c_val * 65536.0 + 0.5);
-}
-
 static void sscp_process_ack(struct sscp_stream *ss,
                             uint32_t ack,
                             uint32_t wnd,
@@ -1136,30 +1122,26 @@ static void sscp_process_ack(struct sscp_stream *ss,
         if (ss->cc_on_ack)
             ss->cc_on_ack(ss, acked);
 
-        if (ss->pacing_round_active != 0 && SEQ_GEQ(ack, ss->pacing_mark_seq)) {
+        if (ss->pacing_round_active != 0 && ss->pacing_mark_seq != 0 && SEQ_GEQ(ack, ss->pacing_mark_seq)) {
             uint64_t rtt_scaled = ((uint64_t)ss->srtt) << SSCP_PACING_SHIFT;
-            if (rtt_scaled > 0 && ss->pacing_round_pkts > 0) {
-                uint64_t now_scaled = ((uint64_t)sscp_now_time()) << SSCP_PACING_SHIFT;
-                uint64_t backlog = (ss->pacing_next_time > now_scaled) ?
-                                   (ss->pacing_next_time - now_scaled) : 0ULL;
-                uint64_t t_eff = ss->pacing_round_work + backlog;
-
+            if (rtt_scaled > 0 && ss->pacing_round_pkts > 0 && ss->pacing_round_end_time > ss->pacing_round_start_time) {
+                uint64_t L_span = ss->pacing_round_end_time - ss->pacing_round_start_time;
                 uint32_t w0 = ss->pacing_w_start;
                 uint32_t w1 = ss->cwnd / MSS;
                 if (w1 == 0) w1 = 1;
-                uint32_t c_q16 = sscp_calc_c_q16(w0, w1, ss->pacing_round_pkts);
 
-                uint32_t g_curr = ss->pacing_gain_q16 ? ss->pacing_gain_q16 : SSCP_GAIN_SS_Q16;
-                /* g_target = g_curr * (T_eff / RTT) */
-                uint64_t g_target = (((uint64_t)g_curr) * t_eff) / rtt_scaled;
+                uint32_t g_curr = ss->pacing_gain_q16 ? ss->pacing_gain_q16 : 65536U;
+                /* g_target = g_curr * (L_span / RTT) */
+                uint64_t g_target = (((uint64_t)g_curr) * L_span) / rtt_scaled;
                 if (g_target < 32768ULL) g_target = 32768ULL;
-                if (g_target > 196608ULL) g_target = 196608ULL;
+                if (g_target > 262144ULL) g_target = 262144ULL;
 
                 uint32_t g_next = (uint32_t)((((uint64_t)g_curr) + g_target) >> 1);
 
-                printf("[PACING_RESEARCH] w0=%u w1=%u N=%u C=%.4f g_curr=%.4f g_target=%.4f g_next=%.4f cwnd=%u ssthresh=%u\n",
+                printf("[PACING_RESEARCH] w0=%u w1=%u N=%u L_ms=%.3f RTT_ms=%.3f g_curr=%.4f g_target=%.4f g_next=%.4f cwnd=%u ssthresh=%u\n",
                        w0, w1, ss->pacing_round_pkts,
-                       (double)c_q16 / 65536.0,
+                       (double)(L_span >> SSCP_PACING_SHIFT) / SSCP_TICK_SCALE,
+                       (double)ss->srtt / SSCP_TICK_SCALE,
                        (double)g_curr / 65536.0,
                        (double)g_target / 65536.0,
                        (double)g_next / 65536.0,
@@ -1168,6 +1150,7 @@ static void sscp_process_ack(struct sscp_stream *ss,
                 ss->pacing_gain_q16 = g_next;
             }
             ss->pacing_round_active = 0;
+            ss->pacing_mark_seq = 0;
         }
 
         ss->rto_recovery = 0;
@@ -1342,6 +1325,7 @@ static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
 static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
 {
     uint32_t now;
+    uint32_t last_frag_end = 0;
 
     now = sscp_now_time();
     if (SEQ_LT((uint32_t)(ss->pacing_next_time >> SSCP_PACING_SHIFT), now))
@@ -1364,18 +1348,19 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
         }
 
         if (ss->pacing_round_active == 0) {
-            ss->pacing_mark_seq = sb->seq;
             ss->pacing_w_start = ss->cwnd / MSS;
             if (ss->pacing_w_start == 0) ss->pacing_w_start = 1;
-            ss->pacing_round_work = 0;
+            ss->pacing_round_start_time = ss->pacing_next_time;
             ss->pacing_round_pkts = 0;
             ss->pacing_round_active = 1;
+            ss->pacing_mark_seq = 0;
         }
         sb->sent_time = ss->pacing_next_time;
         uint64_t gap = sscp_pacing_time(ss, frag_len);
         ss->pacing_next_time += gap;
-        ss->pacing_round_work += gap;
+        ss->pacing_round_end_time = ss->pacing_next_time;
         ss->pacing_round_pkts++;
+        last_frag_end = sb->seq + frag_len;
 
         if (next == &ss->snd_q) {
             ss->schedule_next = NULL;
@@ -1384,6 +1369,10 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
         }
 
         available -= frag_len;
+    }
+
+    if (ss->pacing_round_active == 1 && ss->pacing_mark_seq == 0 && last_frag_end != 0) {
+        ss->pacing_mark_seq = last_frag_end;
     }
 }
 
@@ -2392,7 +2381,8 @@ static void sscp_aimd_init(struct sscp_stream *ss)
     ss->pacing_gain_q16 = SSCP_GAIN_SS_Q16;
     ss->pacing_mark_seq = 0;
     ss->pacing_w_start = 1;
-    ss->pacing_round_work = 0;
+    ss->pacing_round_start_time = 0;
+    ss->pacing_round_end_time = 0;
     ss->pacing_round_pkts = 0;
     ss->pacing_round_active = 0;
 
