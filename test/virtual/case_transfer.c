@@ -146,6 +146,8 @@ int main(int argc, char **argv)
     FILE *summary;
     const char *xpl_path = NULL;
     const char *csv_path = NULL;
+    int start_ca = 0;
+    uint32_t init_g_q16 = 0;
     int i, ok = 0, cc = SSCP_CC_AIMD;
     for (i = 1; i < argc; i += 2) {
         uint64_t value;
@@ -179,6 +181,8 @@ int main(int argc, char **argv)
             if (value < MSS || value > UINT32_MAX) return 2;
             backlog = (uint32_t)value;
         }
+        else if (!strcmp(argv[i], "--start-ca")) start_ca = (int)value;
+        else if (!strcmp(argv[i], "--init-g")) init_g_q16 = (uint32_t)value;
         else return 2;
     }
     if (!total || loss > 1000000 || !timeout || (cc != SSCP_CC_AIMD && cc != SSCP_CC_PROB)) return 2;
@@ -204,6 +208,22 @@ int main(int argc, char **argv)
     if (sscp_init(16)) return 2;
     if (transfer_init(&b, &tb, 2, 1, 0, total, cc) ||
         transfer_init(&a, &ta, 1, 2, 1, total, cc)) return 2;
+    if (start_ca) {
+        a.stream->cwnd = MSS;
+        a.stream->ssthresh = MSS;
+        b.stream->cwnd = MSS;
+        b.stream->ssthresh = MSS;
+        if (init_g_q16 > 0) {
+            a.stream->pacing_gain_q16 = init_g_q16;
+            b.stream->pacing_gain_q16 = init_g_q16;
+        } else {
+            a.stream->pacing_gain_q16 = 65536;
+            b.stream->pacing_gain_q16 = 65536;
+        }
+    } else if (init_g_q16 > 0) {
+        a.stream->pacing_gain_q16 = init_g_q16;
+        b.stream->pacing_gain_q16 = init_g_q16;
+    }
     if (cc == SSCP_CC_PROB &&
         (sscp_prob_configure(a.stream, 100, 8000) || sscp_prob_configure(b.stream, 100, 8000))) return 2;
     vnet_attach(&a, &b);
