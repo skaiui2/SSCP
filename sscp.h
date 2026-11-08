@@ -52,7 +52,7 @@ struct sscp_timer {
 #define RECV_WIN_INIT (1 << 24)
 #endif
 #ifndef CWND_WIN_MAX
-#define CWND_WIN_MAX  (1 << 20)
+#define CWND_WIN_MAX  (4096 * 1460)
 #endif
 #define MTU 1460
 #define PERSIST_INTERVAL (200U * (SSCP_TICK_SCALE))
@@ -226,6 +226,14 @@ struct sscp_stream {
     uint32_t (*cc_pacing_gain)(struct sscp_stream *ss);
     void (*cc_on_loss)(struct sscp_stream *ss);
     void (*cc_on_timeout)(struct sscp_stream *ss);
+
+    /* Adaptive Bisection Pacing (Research Branch) */
+    uint32_t pacing_gain_q16;
+    uint32_t pacing_mark_seq;
+    uint32_t pacing_w_start;
+    uint64_t pacing_round_work;
+    uint32_t pacing_round_pkts;
+    uint8_t  pacing_round_active;
 };
 
 /*

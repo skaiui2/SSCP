@@ -1094,6 +1094,22 @@ static inline int sscp_sack_gap_valid(struct sscp_stream *ss,
  * The ACK also reflects the peer’s congestion state.
  * Handle ACK: update RTT, free bufferr, run SB.
  */
+#include <math.h>
+
+static inline uint32_t sscp_calc_c_q16(uint32_t w0, uint32_t w1, uint32_t N)
+{
+    if (w0 == 0) w0 = 1;
+    if (w1 <= w0) {
+        return (N > 0 && w0 > 0) ? (uint32_t)(((uint64_t)N * 65536ULL) / w0) : 65536U;
+    }
+    double dw = (double)(w1 - w0);
+    double ratio = (double)w1 / (double)w0;
+    double c_val = (double)N * log(ratio) / dw;
+    if (c_val < 0.5) c_val = 0.5;
+    if (c_val > 2.5) c_val = 2.5;
+    return (uint32_t)(c_val * 65536.0 + 0.5);
+}
+
 static void sscp_process_ack(struct sscp_stream *ss,
                             uint32_t ack,
                             uint32_t wnd,
@@ -1119,6 +1135,40 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
         if (ss->cc_on_ack)
             ss->cc_on_ack(ss, acked);
+
+        if (ss->pacing_round_active != 0 && SEQ_GEQ(ack, ss->pacing_mark_seq)) {
+            uint64_t rtt_scaled = ((uint64_t)ss->srtt) << SSCP_PACING_SHIFT;
+            if (rtt_scaled > 0 && ss->pacing_round_pkts > 0) {
+                uint64_t now_scaled = ((uint64_t)sscp_now_time()) << SSCP_PACING_SHIFT;
+                uint64_t backlog = (ss->pacing_next_time > now_scaled) ?
+                                   (ss->pacing_next_time - now_scaled) : 0ULL;
+                uint64_t t_eff = ss->pacing_round_work + backlog;
+
+                uint32_t w0 = ss->pacing_w_start;
+                uint32_t w1 = ss->cwnd / MSS;
+                if (w1 == 0) w1 = 1;
+                uint32_t c_q16 = sscp_calc_c_q16(w0, w1, ss->pacing_round_pkts);
+
+                uint32_t g_curr = ss->pacing_gain_q16 ? ss->pacing_gain_q16 : SSCP_GAIN_SS_Q16;
+                /* g_target = g_curr * (T_eff / RTT) */
+                uint64_t g_target = (((uint64_t)g_curr) * t_eff) / rtt_scaled;
+                if (g_target < 32768ULL) g_target = 32768ULL;
+                if (g_target > 196608ULL) g_target = 196608ULL;
+
+                uint32_t g_next = (uint32_t)((((uint64_t)g_curr) + g_target) >> 1);
+
+                printf("[PACING_RESEARCH] w0=%u w1=%u N=%u C=%.4f g_curr=%.4f g_target=%.4f g_next=%.4f cwnd=%u ssthresh=%u\n",
+                       w0, w1, ss->pacing_round_pkts,
+                       (double)c_q16 / 65536.0,
+                       (double)g_curr / 65536.0,
+                       (double)g_target / 65536.0,
+                       (double)g_next / 65536.0,
+                       ss->cwnd / MSS, ss->ssthresh / MSS);
+
+                ss->pacing_gain_q16 = g_next;
+            }
+            ss->pacing_round_active = 0;
+        }
 
         ss->rto_recovery = 0;
     }
@@ -1264,6 +1314,7 @@ void sscp_output_data(struct sscp_stream *ss, struct sscp_buf *sb)
     ss->sent_cnt++;
 }
 
+
 static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
 {
     uint32_t rtt;
@@ -1312,8 +1363,19 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
             ss->pacing_next = sb;
         }
 
+        if (ss->pacing_round_active == 0) {
+            ss->pacing_mark_seq = sb->seq;
+            ss->pacing_w_start = ss->cwnd / MSS;
+            if (ss->pacing_w_start == 0) ss->pacing_w_start = 1;
+            ss->pacing_round_work = 0;
+            ss->pacing_round_pkts = 0;
+            ss->pacing_round_active = 1;
+        }
         sb->sent_time = ss->pacing_next_time;
-        ss->pacing_next_time += sscp_pacing_time(ss, frag_len);
+        uint64_t gap = sscp_pacing_time(ss, frag_len);
+        ss->pacing_next_time += gap;
+        ss->pacing_round_work += gap;
+        ss->pacing_round_pkts++;
 
         if (next == &ss->snd_q) {
             ss->schedule_next = NULL;
@@ -2315,6 +2377,8 @@ static uint32_t sscp_prob_on_rtt(struct sscp_stream *ss)
 
 static uint32_t sscp_aimd_pacing_gain(struct sscp_stream *ss)
 {
+    if (ss->pacing_gain_q16 != 0)
+        return ss->pacing_gain_q16;
     if (ss->cwnd < ss->ssthresh)
         return SSCP_GAIN_SS_Q16;
     return SSCP_GAIN_CA_Q16;
@@ -2325,6 +2389,12 @@ static void sscp_aimd_init(struct sscp_stream *ss)
     ss->cwnd = MSS;
     ss->cwnd_cnt = 0;
     ss->ssthresh = CWND_WIN_MAX;
+    ss->pacing_gain_q16 = SSCP_GAIN_SS_Q16;
+    ss->pacing_mark_seq = 0;
+    ss->pacing_w_start = 1;
+    ss->pacing_round_work = 0;
+    ss->pacing_round_pkts = 0;
+    ss->pacing_round_active = 0;
 
     ss->dup_acks = 0;
     ss->fr_active = 0;
