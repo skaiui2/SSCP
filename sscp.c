@@ -1123,31 +1123,46 @@ static void sscp_process_ack(struct sscp_stream *ss,
             ss->cc_on_ack(ss, acked);
 
         if (ss->pacing_round_active != 0 && ss->pacing_mark_seq != 0 && SEQ_GEQ(ack, ss->pacing_mark_seq)) {
-            uint64_t rtt_scaled = ((uint64_t)ss->srtt) << SSCP_PACING_SHIFT;
-            if (rtt_scaled > 0 && ss->pacing_round_pkts > 0 && ss->pacing_round_end_time > ss->pacing_round_start_time) {
+            if (ss->srtt > 0 && ss->pacing_round_pkts > 0 && ss->pacing_round_end_time > ss->pacing_round_start_time) {
                 uint64_t L_span = ss->pacing_round_end_time - ss->pacing_round_start_time;
                 uint32_t w0 = ss->pacing_w_start;
                 uint32_t w1 = ss->cwnd / MSS;
                 if (w1 == 0) w1 = 1;
 
                 uint32_t g_curr = ss->pacing_gain_q16 ? ss->pacing_gain_q16 : 65536U;
-                /* g_target = g_curr * (L_span / RTT) */
-                uint64_t g_target = (((uint64_t)g_curr) * L_span) / rtt_scaled;
-                if (g_target < 32768ULL) g_target = 32768ULL;
-                if (g_target > 262144ULL) g_target = 262144ULL;
 
-                uint32_t g_next = (uint32_t)((((uint64_t)g_curr) + g_target) >> 1);
+                if (w0 == 1 && ss->pacing_round_pkts <= 1) {
+                    /* Initial probe packet: srtt was 0 when this packet was scheduled.
+                     * Keep initial configured gain without corrupting it with the 1ms fallback gap. */
+                    printf("[PACING_RESEARCH] w0=%u w1=%u N=%u L_ms=%.3f RTT_ms=%.3f g_curr=%.4f (initial probe) cwnd=%u ssthresh=%u\n",
+                           w0, w1, ss->pacing_round_pkts,
+                           (double)L_span / ((double)(1ULL << SSCP_PACING_SHIFT) * SSCP_TICK_SCALE),
+                           (double)ss->srtt / SSCP_TICK_SCALE,
+                           (double)g_curr / 65536.0,
+                           ss->cwnd / MSS, ss->ssthresh / MSS);
+                } else {
+                    double span_ms = (double)L_span / ((double)(1ULL << SSCP_PACING_SHIFT) * SSCP_TICK_SCALE);
+                    double rtt_ms = (double)ss->srtt / SSCP_TICK_SCALE;
+                    /* Physical first principle: g_target = g_curr * (L / RTT) */
+                    double g_target_d = ((double)g_curr * span_ms) / rtt_ms;
+                    if (g_target_d < 32768.0) g_target_d = 32768.0;
+                    if (g_target_d > 262144.0) g_target_d = 262144.0;
+                    uint32_t g_target = (uint32_t)(g_target_d + 0.5);
 
-                printf("[PACING_RESEARCH] w0=%u w1=%u N=%u L_ms=%.3f RTT_ms=%.3f g_curr=%.4f g_target=%.4f g_next=%.4f cwnd=%u ssthresh=%u\n",
-                       w0, w1, ss->pacing_round_pkts,
-                       (double)(L_span >> SSCP_PACING_SHIFT) / SSCP_TICK_SCALE,
-                       (double)ss->srtt / SSCP_TICK_SCALE,
-                       (double)g_curr / 65536.0,
-                       (double)g_target / 65536.0,
-                       (double)g_next / 65536.0,
-                       ss->cwnd / MSS, ss->ssthresh / MSS);
+                    /* Bisection smoothing: g_next = (g_curr + g_target) / 2 */
+                    uint32_t g_next = (g_curr + g_target) >> 1;
 
-                ss->pacing_gain_q16 = g_next;
+                    printf("[PACING_RESEARCH] w0=%u w1=%u N=%u L_ms=%.3f RTT_ms=%.3f g_curr=%.4f g_target=%.4f g_next=%.4f cwnd=%u ssthresh=%u\n",
+                           w0, w1, ss->pacing_round_pkts,
+                           span_ms,
+                           rtt_ms,
+                           (double)g_curr / 65536.0,
+                           (double)g_target / 65536.0,
+                           (double)g_next / 65536.0,
+                           ss->cwnd / MSS, ss->ssthresh / MSS);
+
+                    ss->pacing_gain_q16 = g_next;
+                }
             }
             ss->pacing_round_active = 0;
             ss->pacing_mark_seq = 0;
