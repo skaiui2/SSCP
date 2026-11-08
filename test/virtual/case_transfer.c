@@ -30,6 +30,14 @@ static uint64_t wire_bytes[2];
 static int data_seen[2], sequence_ok = 1;
 static void (*timeout_handler[2])(struct sscp_stream *);
 
+static FILE *xpl_fp = NULL;
+static FILE *csv_fp = NULL;
+static int64_t xpl_first_tick = -1;
+static uint32_t xpl_base_seq = 0;
+static uint32_t xpl_prev_ack = 0;
+static double xpl_prev_t = 0.0;
+static int xpl_has_prev_ack = 0;
+
 static void count_timeout(struct sscp_stream *ss)
 {
     ++timeouts[ss->src_fd - 1];
@@ -41,7 +49,6 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
     const struct sscp_hdr *h = buf;
     struct sscp_stream *s;
     uint32_t seq, bytes;
-    (void)now;
     if (len < sizeof(*h)) { sequence_ok = 0; return; }
     bytes = ntohs(h->len);
     seq = ntohl(h->seq);
@@ -57,14 +64,53 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
             highest_seq[direction] = seq + bytes;
             wire_bytes[direction] += bytes;
         }
+        if (direction == 0 && bytes > 0) {
+            if (xpl_first_tick < 0) {
+                xpl_first_tick = (int64_t)now;
+                xpl_base_seq = seq;
+            }
+            if (xpl_fp) {
+                double t = (double)(now - (uint32_t)xpl_first_tick) / ((double)SSCP_TICK_SCALE * 1000.0);
+                uint32_t start = seq - xpl_base_seq;
+                uint32_t end = start + bytes;
+                fprintf(xpl_fp, "white\ndarrow %.12f %u\nuarrow %.12f %u\nline %.12f %u %.12f %u\n",
+                        t, start, t, end, t, start, t, end);
+            }
+            if (csv_fp) {
+                fprintf(csv_fp, "0,send,%u,%u,%u,0,%" PRIu32 ",%.3f\n",
+                        h->flags, bytes, seq, now, (double)now / SSCP_TICK_SCALE);
+            }
+        }
     }
-    if (direction != 1 || event != VNET_INPUT_RETURNED || !(h->flags & SSCP_FLAG_ACK)) return;
-    s = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)1);
-    if (!s) return;
-    if (s->srtt) {
-        srtt_sum += s->srtt;
-        ++srtt_samples;
-        if (s->srtt > srtt_max) srtt_max = s->srtt;
+    if (direction == 1 && event == VNET_INPUT_RETURNED && (h->flags & SSCP_FLAG_ACK)) {
+        if (xpl_first_tick >= 0) {
+            double t = (double)(now - (uint32_t)xpl_first_tick) / ((double)SSCP_TICK_SCALE * 1000.0);
+            uint32_t ack = ntohl(h->ack) - xpl_base_seq;
+            if (xpl_fp) {
+                fprintf(xpl_fp, "green\n");
+                if (!xpl_has_prev_ack) {
+                    fprintf(xpl_fp, "dot %.12f %u\n", t, ack);
+                } else {
+                    fprintf(xpl_fp, "line %.12f %u %.12f %u\n", xpl_prev_t, xpl_prev_ack, t, xpl_prev_ack);
+                    if (ack != xpl_prev_ack) {
+                        fprintf(xpl_fp, "line %.12f %u %.12f %u\n", t, xpl_prev_ack, t, ack);
+                    }
+                }
+                xpl_prev_ack = ack;
+                xpl_prev_t = t;
+                xpl_has_prev_ack = 1;
+            }
+            if (csv_fp) {
+                fprintf(csv_fp, "1,arrival,%u,0,0,%u,%" PRIu32 ",%.3f\n",
+                        h->flags, ntohl(h->ack), now, (double)now / SSCP_TICK_SCALE);
+            }
+        }
+        s = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)1);
+        if (s && s->srtt) {
+            srtt_sum += s->srtt;
+            ++srtt_samples;
+            if (s->srtt > srtt_max) srtt_max = s->srtt;
+        }
     }
 }
 
@@ -98,11 +144,21 @@ int main(int argc, char **argv)
     struct sscp_transport_class tb = {.send = vnet_send, .user = &ep_b};
     struct transfer a, b;
     FILE *summary;
+    const char *xpl_path = NULL;
+    const char *csv_path = NULL;
     int i, ok = 0, cc = SSCP_CC_AIMD;
     for (i = 1; i < argc; i += 2) {
         uint64_t value;
         char *end;
         if (i + 1 >= argc) return 2;
+        if (!strcmp(argv[i], "--xpl")) {
+            xpl_path = argv[i + 1];
+            continue;
+        }
+        if (!strcmp(argv[i], "--events-csv")) {
+            csv_path = argv[i + 1];
+            continue;
+        }
         value = strtoull(argv[i + 1], &end, 10);
         if (*end) return 2;
         if (!strcmp(argv[i], "--bytes")) total = value;
@@ -133,6 +189,18 @@ int main(int argc, char **argv)
     vnet_set_jitter(jitter_ms, allow_reorder);
     vnet_set_markov_drift(markov_drift);
     vnet_observe(observe);
+    if (xpl_path) {
+        xpl_fp = fopen(xpl_path, "w");
+        if (xpl_fp) {
+            fprintf(xpl_fp, "double double\ntitle\nSSCP 128M Adaptive Bisection Pacing TSG\nxlabel\nTime (seconds)\nylabel\nSequence offset (bytes)\n");
+        }
+    }
+    if (csv_path) {
+        csv_fp = fopen(csv_path, "w");
+        if (csv_fp) {
+            fprintf(csv_fp, "direction,event,flags,payload_bytes,seq,ack,t_tick,t_ms\n");
+        }
+    }
     if (sscp_init(16)) return 2;
     if (transfer_init(&b, &tb, 2, 1, 0, total, cc) ||
         transfer_init(&a, &ta, 1, 2, 1, total, cc)) return 2;
@@ -174,6 +242,15 @@ int main(int argc, char **argv)
         (double)srtt_max / SSCP_TICK_SCALE, srtt_avg);
     printf("%s: received=%" PRIu64 " A=%016" PRIx64 " B=%016" PRIx64 " virtual_ms=%.3f dropped=%" PRIu64 "\n", ok ? "PASS" : "FAIL", received, hash_a, hash_b, (double)steps / SSCP_TICK_SCALE, vnet_dropped);
     fclose(summary);
+    if (xpl_fp) {
+        fprintf(xpl_fp, "go\n");
+        fclose(xpl_fp);
+        xpl_fp = NULL;
+    }
+    if (csv_fp) {
+        fclose(csv_fp);
+        csv_fp = NULL;
+    }
     vnet_free();
     return ok ? 0 : 1;
 }
