@@ -88,6 +88,9 @@ int main(int argc, char **argv)
     uint32_t delay = 10, rate = 100, loss = 0, seed = 1, timeout = 36000000;
     uint32_t backlog = TRANSFER_SEND_BACKLOG_BYTES;
     uint32_t queue_packets = 0;
+    uint32_t jitter_ms = 0;
+    int allow_reorder = 0;
+    int markov_drift = 0;
     double srtt_avg;
     int checksum_ok, cleanup_ok;
     struct vnet_endpoint ep_a = {0}, ep_b = {1};
@@ -113,6 +116,9 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--timeout-ms")) timeout = (uint32_t)value;
         else if (!strcmp(argv[i], "--cc")) cc = (int)value;
+        else if (!strcmp(argv[i], "--jitter-ms")) jitter_ms = (uint32_t)value;
+        else if (!strcmp(argv[i], "--reorder")) allow_reorder = (int)value;
+        else if (!strcmp(argv[i], "--markov-drift")) markov_drift = (int)value;
         else if (!strcmp(argv[i], "--send-backlog-bytes")) {
             if (value < MSS || value > UINT32_MAX) return 2;
             backlog = (uint32_t)value;
@@ -124,6 +130,8 @@ int main(int argc, char **argv)
     if (!summary) return 2;
     vnet_init(delay, rate, loss, seed);
     vnet_queue_limit(queue_packets);
+    vnet_set_jitter(jitter_ms, allow_reorder);
+    vnet_set_markov_drift(markov_drift);
     vnet_observe(observe);
     if (sscp_init(16)) return 2;
     if (transfer_init(&b, &tb, 2, 1, 0, total, cc) ||

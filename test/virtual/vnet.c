@@ -21,6 +21,7 @@ struct vnet_channel {
     struct list_node buffer_queue;
     uint64_t next_tx_free_us;
     uint32_t queued_packets;
+    uint64_t last_due_time_us;
 };
 
 struct vnet_network {
@@ -30,6 +31,10 @@ struct vnet_network {
     uint32_t rate_mbps;
     uint32_t loss_ppm;
     uint32_t queue_limit;
+    uint32_t jitter_ms;
+    int allow_reorder;
+    int markov_drift;
+    uint32_t markov_state;
     uint32_t prng_state;
     struct transfer *apps[2];
     vnet_observer observer;
@@ -58,6 +63,7 @@ static void channel_init(struct vnet_channel *ch, unsigned direction)
     list_node_init(&ch->buffer_queue);
     ch->next_tx_free_us = 0;
     ch->queued_packets = 0;
+    ch->last_due_time_us = 0;
 }
 
 static void channel_flush_buffer(struct vnet_channel *ch, uint64_t now_us, uint64_t delay_us)
@@ -98,7 +104,21 @@ static uint64_t channel_calc_tx_finish(struct vnet_channel *ch, uint64_t now_us,
 
 static void channel_enqueue(struct vnet_channel *ch, struct vnet_packet *pkt)
 {
-    queue_enqueue(&ch->wire_queue, &pkt->wire_node);
+    if (!g_vnet.allow_reorder) {
+        if (pkt->due_time_us < ch->last_due_time_us) {
+            pkt->due_time_us = ch->last_due_time_us;
+        }
+        ch->last_due_time_us = pkt->due_time_us;
+        queue_enqueue(&ch->wire_queue, &pkt->wire_node);
+    } else {
+        struct list_node *cur;
+        for (cur = ch->wire_queue.prev; cur != &ch->wire_queue; cur = cur->prev) {
+            struct vnet_packet *p = container_of(cur, struct vnet_packet, wire_node);
+            if (p->due_time_us <= pkt->due_time_us)
+                break;
+        }
+        list_add_next(cur, &pkt->wire_node);
+    }
     queue_enqueue(&ch->buffer_queue, &pkt->buffer_node);
     ++ch->queued_packets;
     ++vnet_pending;
@@ -143,6 +163,7 @@ static void channel_clear(struct vnet_channel *ch)
     list_node_init(&ch->buffer_queue);
     ch->next_tx_free_us = 0;
     ch->queued_packets = 0;
+    ch->last_due_time_us = 0;
 }
 
 uint32_t sscp_now_time(void)
@@ -159,6 +180,17 @@ void vnet_attach(struct transfer *a, struct transfer *b)
 {
     g_vnet.apps[0] = b;
     g_vnet.apps[1] = a;
+}
+
+void vnet_set_jitter(uint32_t jitter_ms, int allow_reorder)
+{
+    g_vnet.jitter_ms = jitter_ms;
+    g_vnet.allow_reorder = allow_reorder;
+}
+
+void vnet_set_markov_drift(int enable)
+{
+    g_vnet.markov_drift = enable;
 }
 
 void vnet_queue_limit(uint32_t packets)
@@ -192,6 +224,10 @@ void vnet_init(uint32_t delay_ms, uint32_t mbps, uint32_t loss_ppm, uint32_t see
     g_vnet.rate_mbps = mbps;
     g_vnet.loss_ppm = loss_ppm;
     g_vnet.queue_limit = 0;
+    g_vnet.jitter_ms = 0;
+    g_vnet.allow_reorder = 0;
+    g_vnet.markov_drift = 0;
+    g_vnet.markov_state = 0;
     g_vnet.prng_state = seed ? seed : 1;
 
     vnet_packets = 0;
@@ -216,7 +252,22 @@ int vnet_send(void *user, const void *buf, size_t len)
     endpoint = (struct vnet_endpoint *)user;
     channel = &g_vnet.channels[endpoint->direction];
     now_us = g_vnet.clock_tick * 1000 / SSCP_TICK_SCALE;
-    delay_us = (uint64_t)g_vnet.delay_ms * 1000;
+    uint64_t cur_delay_ms = g_vnet.delay_ms;
+    if (g_vnet.markov_drift) {
+        if ((vnet_random_step(&g_vnet) % 400) == 0) {
+            g_vnet.markov_state = (g_vnet.markov_state + 1 + (vnet_random_step(&g_vnet) % 2)) % 3;
+        }
+        if (g_vnet.markov_state == 1) {
+            cur_delay_ms = (g_vnet.delay_ms * 3) / 2;
+        } else if (g_vnet.markov_state == 2) {
+            cur_delay_ms = (g_vnet.delay_ms * 5) / 2;
+        }
+    }
+    uint64_t jitter_us = 0;
+    if (g_vnet.jitter_ms > 0) {
+        jitter_us = (uint64_t)(vnet_random_step(&g_vnet) % (g_vnet.jitter_ms * 1000 + 1));
+    }
+    delay_us = cur_delay_ms * 1000 + jitter_us;
 
     ++vnet_packets;
     if (g_vnet.observer) {
