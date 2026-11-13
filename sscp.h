@@ -243,6 +243,7 @@ struct sscp_stream {
     uint32_t budget_next_tick;
     uint32_t static_ss_gain_q16;
     uint32_t static_ca_gain_q16;
+    uint32_t pacing_rttvar_q16;
     uint32_t shadow_bytes;
     uint32_t shadow_cwnd;
     uint32_t shadow_cwnd_cnt;

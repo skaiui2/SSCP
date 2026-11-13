@@ -27,6 +27,7 @@ if(SSCP_TEST_TRANSFER)
     endif()
   endfunction()
   sscp_test_target(sscp_virtual virtual/case_transfer.c virtual/vnet.c common/transfer.c)
+  sscp_test_target(sscp_multiflow virtual/case_multiflow.c virtual/vnet.c common/transfer.c)
   sscp_test_target(sscp_udp common/udp_main.c common/udp_runner.c
     common/real_clock.c common/transfer.c ../sscp.c)
   sscp_test_target(test_close virtual/case_close.c virtual/vnet.c common/transfer.c ../sscp.c)

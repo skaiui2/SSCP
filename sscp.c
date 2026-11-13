@@ -1618,6 +1618,9 @@ static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
         return (uint64_t)SSCP_TICK_SCALE << SSCP_PACING_SHIFT;
 
     rtt = ss->srtt;
+    if (ss->pacing_rttvar_q16 && ss->rttvar > 1 && ss->rttvar < (rtt >> 2)) {
+        rtt += (uint32_t)(((uint64_t)ss->rttvar * ss->pacing_rttvar_q16) >> 16);
+    }
     gain_q16 = ss->cc_pacing_gain(ss);
     reciprocal_q32 = (uint64_t)SSCP_GAIN_ONE_Q16 << SSCP_PACING_SHIFT;
     reciprocal_q32 /= gain_q16;
@@ -2698,6 +2701,7 @@ static void sscp_budget_cc_init(struct sscp_stream *ss)
     ss->budget_next_tick = 0;
     ss->static_ss_gain_q16 = 0;
     ss->static_ca_gain_q16 = 0;
+    ss->pacing_rttvar_q16 = 32768;
     ss->shadow_bytes = 0;
     ss->shadow_cwnd = MSS;
     ss->shadow_cwnd_cnt = 0;

@@ -7,6 +7,7 @@ typedef void (*vnet_observer)(unsigned direction, int event, const void *buf, si
 enum { VNET_SEND, VNET_ARRIVAL, VNET_INPUT_RETURNED };
 void vnet_observe(vnet_observer callback);
 void vnet_attach(struct transfer *a, struct transfer *b);
+void vnet_attach_fd(int local_fd, struct transfer *t);
 struct vnet_endpoint { unsigned direction; };
 void vnet_init(uint32_t delay_ms, uint32_t mbps, uint32_t loss_ppm, uint32_t seed);
 void vnet_queue_limit(uint32_t packets);

@@ -24,6 +24,8 @@ struct vnet_channel {
     uint64_t last_due_time_us;
 };
 
+#define VNET_MAX_APPS 32
+
 struct vnet_network {
     struct vnet_channel channels[2];
     uint64_t clock_tick;
@@ -37,6 +39,7 @@ struct vnet_network {
     uint32_t markov_state;
     uint32_t prng_state;
     struct transfer *apps[2];
+    struct transfer *apps_by_fd[VNET_MAX_APPS];
     vnet_observer observer;
 };
 
@@ -182,6 +185,13 @@ void vnet_attach(struct transfer *a, struct transfer *b)
     g_vnet.apps[1] = a;
 }
 
+void vnet_attach_fd(int local_fd, struct transfer *t)
+{
+    if (local_fd >= 0 && local_fd < VNET_MAX_APPS) {
+        g_vnet.apps_by_fd[local_fd] = t;
+    }
+}
+
 void vnet_set_jitter(uint32_t jitter_ms, int allow_reorder)
 {
     g_vnet.jitter_ms = jitter_ms;
@@ -208,6 +218,7 @@ void vnet_free(void)
     vnet_pending = 0;
     g_vnet.apps[0] = NULL;
     g_vnet.apps[1] = NULL;
+    memset(g_vnet.apps_by_fd, 0, sizeof(g_vnet.apps_by_fd));
     g_vnet.observer = NULL;
 }
 
@@ -219,6 +230,7 @@ void vnet_init(uint32_t delay_ms, uint32_t mbps, uint32_t loss_ppm, uint32_t see
     channel_init(&g_vnet.channels[0], 0);
     channel_init(&g_vnet.channels[1], 1);
 
+    memset(g_vnet.apps_by_fd, 0, sizeof(g_vnet.apps_by_fd));
     g_vnet.clock_tick = 0;
     g_vnet.delay_ms = delay_ms;
     g_vnet.rate_mbps = mbps;
@@ -321,8 +333,13 @@ static int dispatch_packet(unsigned direction, struct vnet_packet *pkt)
     hdr = (const struct sscp_hdr *)pkt->data;
     fd = (int)hdr->fd;
 
-    if (g_vnet.apps[direction]) {
-        result = transfer_input(g_vnet.apps[direction], pkt->data, pkt->length);
+    struct transfer *app =
+        (fd >= 0 && fd < VNET_MAX_APPS && g_vnet.apps_by_fd[fd])
+            ? g_vnet.apps_by_fd[fd]
+            : g_vnet.apps[direction];
+
+    if (app) {
+        result = transfer_input(app, pkt->data, pkt->length);
     } else {
         result = sscp_input(NULL, pkt->data, pkt->length);
     }

@@ -151,6 +151,7 @@ int main(int argc, char **argv)
     uint32_t init_g_q16 = 0;
     uint32_t static_ss_g_q16 = 0;
     uint32_t static_ca_g_q16 = 0;
+    int64_t pacing_rttvar_q16 = -1;
     int i, ok = 0, cc = SSCP_CC_AIMD;
     for (i = 1; i < argc; i += 2) {
         uint64_t value;
@@ -189,6 +190,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--budget-pacing")) budget_pacing = (int)(value != 0);
         else if (!strcmp(argv[i], "--ss-g")) static_ss_g_q16 = (uint32_t)value;
         else if (!strcmp(argv[i], "--ca-g")) static_ca_g_q16 = (uint32_t)value;
+        else if (!strcmp(argv[i], "--rttvar-k")) pacing_rttvar_q16 = (int64_t)value;
         else return 2;
     }
     if (!total || loss > 1000000 || !timeout ||
@@ -236,6 +238,10 @@ int main(int argc, char **argv)
     if (static_ca_g_q16 > 0) {
         a.stream->static_ca_gain_q16 = static_ca_g_q16;
         b.stream->static_ca_gain_q16 = static_ca_g_q16;
+    }
+    if (pacing_rttvar_q16 >= 0) {
+        a.stream->pacing_rttvar_q16 = (uint32_t)pacing_rttvar_q16;
+        b.stream->pacing_rttvar_q16 = (uint32_t)pacing_rttvar_q16;
     }
     if (cc == SSCP_CC_PROB &&
         (sscp_prob_configure(a.stream, 100, 8000) || sscp_prob_configure(b.stream, 100, 8000))) return 2;
