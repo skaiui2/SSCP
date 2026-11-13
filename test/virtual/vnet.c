@@ -22,6 +22,11 @@ struct vnet_channel {
     uint64_t next_tx_free_us;
     uint32_t queued_packets;
     uint64_t last_due_time_us;
+    uint32_t *qdepths;
+    uint32_t *qdelays_us;
+    uint32_t *owds_us;
+    size_t stat_count;
+    size_t stat_cap;
 };
 
 #define VNET_MAX_APPS 32
@@ -67,6 +72,35 @@ static void channel_init(struct vnet_channel *ch, unsigned direction)
     ch->next_tx_free_us = 0;
     ch->queued_packets = 0;
     ch->last_due_time_us = 0;
+    ch->qdepths = NULL;
+    ch->qdelays_us = NULL;
+    ch->owds_us = NULL;
+    ch->stat_count = 0;
+    ch->stat_cap = 0;
+}
+
+static void channel_record_stat(struct vnet_channel *ch, uint32_t qdepth, uint32_t qdelay_us, uint32_t owd_us)
+{
+    if (ch->stat_count == ch->stat_cap) {
+        size_t new_cap = ch->stat_cap ? ch->stat_cap * 2 : 1024;
+        uint32_t *qd = realloc(ch->qdepths, new_cap * sizeof(uint32_t));
+        uint32_t *ql = realloc(ch->qdelays_us, new_cap * sizeof(uint32_t));
+        uint32_t *ow = realloc(ch->owds_us, new_cap * sizeof(uint32_t));
+        if (!qd || !ql || !ow) {
+            if (qd) ch->qdepths = qd;
+            if (ql) ch->qdelays_us = ql;
+            if (ow) ch->owds_us = ow;
+            return;
+        }
+        ch->qdepths = qd;
+        ch->qdelays_us = ql;
+        ch->owds_us = ow;
+        ch->stat_cap = new_cap;
+    }
+    ch->qdepths[ch->stat_count] = qdepth;
+    ch->qdelays_us[ch->stat_count] = qdelay_us;
+    ch->owds_us[ch->stat_count] = owd_us;
+    ++ch->stat_count;
 }
 
 static void channel_flush_buffer(struct vnet_channel *ch, uint64_t now_us, uint64_t delay_us)
@@ -167,6 +201,64 @@ static void channel_clear(struct vnet_channel *ch)
     ch->next_tx_free_us = 0;
     ch->queued_packets = 0;
     ch->last_due_time_us = 0;
+    free(ch->qdepths);
+    free(ch->qdelays_us);
+    free(ch->owds_us);
+    ch->qdepths = NULL;
+    ch->qdelays_us = NULL;
+    ch->owds_us = NULL;
+    ch->stat_count = 0;
+    ch->stat_cap = 0;
+}
+
+static int cmp_u32_asc(const void *pa, const void *pb)
+{
+    uint32_t a = *(const uint32_t *)pa;
+    uint32_t b = *(const uint32_t *)pb;
+    return (a > b) - (a < b);
+}
+
+static uint32_t pct_u32_sorted(const uint32_t *arr, size_t n, double p)
+{
+    size_t idx;
+    if (!n) return 0;
+    idx = (size_t)(p * (double)(n - 1) + 0.5);
+    if (idx >= n) idx = n - 1;
+    return arr[idx];
+}
+
+void vnet_get_stats(unsigned direction, struct vnet_stats *out)
+{
+    struct vnet_channel *ch;
+    size_t i, n;
+    uint64_t qsum = 0, qdsum = 0;
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (direction > 1 || !g_vnet_initialized) return;
+    ch = &g_vnet.channels[direction];
+    n = ch->stat_count;
+    if (!n) return;
+    qsort(ch->qdepths, n, sizeof(uint32_t), cmp_u32_asc);
+    qsort(ch->qdelays_us, n, sizeof(uint32_t), cmp_u32_asc);
+    qsort(ch->owds_us, n, sizeof(uint32_t), cmp_u32_asc);
+    for (i = 0; i < n; ++i) {
+        qsum += ch->qdepths[i];
+        qdsum += ch->qdelays_us[i];
+    }
+    out->samples = (uint64_t)n;
+    out->q_max = ch->qdepths[n - 1];
+    out->q_avg = (double)qsum / (double)n;
+    out->q_p95 = (double)pct_u32_sorted(ch->qdepths, n, 0.95);
+    out->q_p99 = (double)pct_u32_sorted(ch->qdepths, n, 0.99);
+    out->qdelay_avg_ms = (double)qdsum / (double)n / 1000.0;
+    out->qdelay_p50_ms = (double)pct_u32_sorted(ch->qdelays_us, n, 0.50) / 1000.0;
+    out->qdelay_p95_ms = (double)pct_u32_sorted(ch->qdelays_us, n, 0.95) / 1000.0;
+    out->qdelay_p99_ms = (double)pct_u32_sorted(ch->qdelays_us, n, 0.99) / 1000.0;
+    out->qdelay_max_ms = (double)ch->qdelays_us[n - 1] / 1000.0;
+    out->owd_p50_ms = (double)pct_u32_sorted(ch->owds_us, n, 0.50) / 1000.0;
+    out->owd_p95_ms = (double)pct_u32_sorted(ch->owds_us, n, 0.95) / 1000.0;
+    out->owd_p99_ms = (double)pct_u32_sorted(ch->owds_us, n, 0.99) / 1000.0;
+    out->owd_max_ms = (double)ch->owds_us[n - 1] / 1000.0;
 }
 
 uint32_t sscp_now_time(void)
@@ -294,6 +386,8 @@ int vnet_send(void *user, const void *buf, size_t len)
         return (int)len;
     }
 
+    uint64_t prev_tx_free = channel->next_tx_free_us;
+    uint32_t qwait_us = (g_vnet.rate_mbps && prev_tx_free > now_us) ? (uint32_t)(prev_tx_free - now_us) : 0;
     tx_finish_us = channel_calc_tx_finish(channel, now_us, len, g_vnet.rate_mbps);
 
     is_random_drop = (vnet_random_step(&g_vnet) % 1000000) < g_vnet.loss_ppm;
@@ -317,6 +411,10 @@ int vnet_send(void *user, const void *buf, size_t len)
     memcpy(pkt->data, buf, len);
 
     channel_enqueue(channel, pkt);
+    if (!is_random_drop) {
+        uint32_t owd_us = (pkt->due_time_us > now_us) ? (uint32_t)(pkt->due_time_us - now_us) : 0;
+        channel_record_stat(channel, channel->queued_packets, qwait_us, owd_us);
+    }
     return (int)len;
 }
 

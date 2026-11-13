@@ -373,6 +373,8 @@ int main(int argc, char **argv)
     }
     int cleanup_ok = !core_live && !sscp_timer_tree.count && list_empty(&sscp_stream_queue);
     ok = ok && checksum_ok && cleanup_ok;
+    struct vnet_stats vstats;
+    vnet_get_stats(0, &vstats);
 
     fprintf(summary,
         "{\"success\":%s,\"nflows\":%d,\"mbps\":%u,\"delay_ms\":%u,\"queue_packets\":%u,"
@@ -381,14 +383,20 @@ int main(int argc, char **argv)
         "\"fct0_ms\":%.2f,\"fct1_ms\":%.2f,"
         "\"retrans0\":%" PRIu64 ",\"retrans1\":%" PRIu64 ","
         "\"timeouts0\":%" PRIu64 ",\"timeouts1\":%" PRIu64 ","
-        "\"queue_dropped\":%" PRIu64 ",\"packets\":%" PRIu64 ",",
+        "\"queue_dropped\":%" PRIu64 ",\"packets\":%" PRIu64 ","
+        "\"q_max\":%u,\"q_avg\":%.3f,\"q_p95\":%.1f,\"q_p99\":%.1f,"
+        "\"qdelay_avg_ms\":%.4f,\"qdelay_p95_ms\":%.4f,\"qdelay_p99_ms\":%.4f,\"qdelay_max_ms\":%.4f,"
+        "\"owd_p99_ms\":%.4f,",
         ok ? "true" : "false", g_nflows, rate, delay, queue_packets, loss, jitter_ms, ov_ms,
         share[0], (g_nflows > 1 ? share[1] : 0.0), min_share, max_share, jain,
         (double)fct_ticks[0] / SSCP_TICK_SCALE,
         (g_nflows > 1 ? (double)fct_ticks[1] / SSCP_TICK_SCALE : 0.0),
         retrans_flow[0], (g_nflows > 1 ? retrans_flow[1] : 0),
         timeouts_fd[1] + timeouts_fd[2], (g_nflows > 1 ? timeouts_fd[3] + timeouts_fd[4] : 0),
-        vnet_queue_dropped, vnet_packets);
+        vnet_queue_dropped, vnet_packets,
+        vstats.q_max, vstats.q_avg, vstats.q_p95, vstats.q_p99,
+        vstats.qdelay_avg_ms, vstats.qdelay_p95_ms, vstats.qdelay_p99_ms, vstats.qdelay_max_ms,
+        vstats.owd_p99_ms);
 
     fprintf(summary, "\"shares\":[");
     for (i = 0; i < g_nflows; ++i) fprintf(summary, "%s%.4f", i ? "," : "", share[i]);

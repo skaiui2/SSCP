@@ -18,4 +18,21 @@ int vnet_step(void);
 void vnet_free(void);
 extern uint64_t vnet_packets, vnet_dropped;
 extern uint64_t vnet_queue_dropped, vnet_pending;
+struct vnet_stats {
+    uint64_t samples;
+    uint32_t q_max;
+    double q_avg;
+    double q_p95;
+    double q_p99;
+    double qdelay_avg_ms;
+    double qdelay_p50_ms;
+    double qdelay_p95_ms;
+    double qdelay_p99_ms;
+    double qdelay_max_ms;
+    double owd_p50_ms;
+    double owd_p95_ms;
+    double owd_p99_ms;
+    double owd_max_ms;
+};
+void vnet_get_stats(unsigned direction, struct vnet_stats *out);
 #endif

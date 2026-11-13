@@ -26,6 +26,9 @@ static void count_free(void *p)
 static uint64_t retrans_packets, timeouts[2];
 static uint64_t srtt_samples, srtt_sum;
 static uint32_t srtt_max, highest_seq[2];
+static uint32_t *rtt_arr = NULL;
+static size_t rtt_cnt = 0, rtt_cap = 0;
+static int cmp_u32_ct(const void *pa, const void *pb) { uint32_t a = *(const uint32_t *)pa, b = *(const uint32_t *)pb; return (a > b) - (a < b); }
 static uint64_t wire_bytes[2];
 static int data_seen[2], sequence_ok = 1;
 static void (*timeout_handler[2])(struct sscp_stream *);
@@ -110,6 +113,14 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
             srtt_sum += s->srtt;
             ++srtt_samples;
             if (s->srtt > srtt_max) srtt_max = s->srtt;
+            if (s->rtt_sample) {
+                if (rtt_cnt == rtt_cap) {
+                    size_t nc = rtt_cap ? rtt_cap * 2 : 1024;
+                    uint32_t *nr = realloc(rtt_arr, nc * sizeof(uint32_t));
+                    if (nr) { rtt_arr = nr; rtt_cap = nc; }
+                }
+                if (rtt_cnt < rtt_cap) rtt_arr[rtt_cnt++] = s->rtt_sample;
+            }
         }
     }
 }
@@ -267,18 +278,37 @@ int main(int argc, char **argv)
     cleanup_ok = !core_live && !sscp_timer_tree.count && list_empty(&sscp_stream_queue);
     ok = ok && checksum_ok && sequence_ok && cleanup_ok;
     srtt_avg = srtt_samples ? (double)srtt_sum / srtt_samples / SSCP_TICK_SCALE : 0;
+    struct vnet_stats vstats;
+    vnet_get_stats(0, &vstats);
+    double rtt_p50 = 0.0, rtt_p95 = 0.0, rtt_p99 = 0.0, rtt_pmax = 0.0;
+    if (rtt_cnt > 0) {
+        qsort(rtt_arr, rtt_cnt, sizeof(uint32_t), cmp_u32_ct);
+        rtt_p50 = (double)rtt_arr[(size_t)(0.50 * (rtt_cnt - 1) + 0.5)] / SSCP_TICK_SCALE;
+        rtt_p95 = (double)rtt_arr[(size_t)(0.95 * (rtt_cnt - 1) + 0.5)] / SSCP_TICK_SCALE;
+        rtt_p99 = (double)rtt_arr[(size_t)(0.99 * (rtt_cnt - 1) + 0.5)] / SSCP_TICK_SCALE;
+        rtt_pmax = (double)rtt_arr[rtt_cnt - 1] / SSCP_TICK_SCALE;
+    }
+    free(rtt_arr); rtt_arr = NULL; rtt_cnt = rtt_cap = 0;
     fprintf(summary, "{\"success\":%s,\"requested_bytes\":%" PRIu64 ",\"accepted_bytes\":%" PRIu64 ",\"received_bytes\":%" PRIu64 ",\"checksum_algorithm\":\"FNV-1a-64\",\"checksum_a\":\"%016" PRIx64 "\",\"checksum_b\":\"%016" PRIx64 "\",\"simulated_ms\":%.3f,\"simulated_ticks\":%" PRIu64 ",\"tick_scale\":%u,\"cc\":%d,\"mbps\":%u,\"delay_ms\":%u,\"loss_ppm\":%u,\"seed\":%u,\"transport\":\"%s\",\"send_backlog_bytes\":%u,\"packets\":%" PRIu64 ",\"dropped\":%" PRIu64, ok ? "true" : "false", total, sent, received, hash_a, hash_b, (double)steps / SSCP_TICK_SCALE, steps, SSCP_TICK_SCALE, cc, rate, delay, loss, seed, rate ? "serialized_link" : "fixed_delay", backlog, vnet_packets, vnet_dropped);
     fprintf(summary, ",\"queue_packets\":%u,\"queue_dropped\":%" PRIu64
         ",\"checksum_ok\":%s,\"sequence_ok\":%s,\"cleanup_ok\":%s"
         ",\"core_live_allocations\":%" PRId64 ",\"active_timers\":%u"
         ",\"timeouts\":%" PRIu64 ",\"retrans_packets\":%" PRIu64
         ",\"timeouts_a\":%" PRIu64 ",\"timeouts_b\":%" PRIu64
-        ",\"srtt_max_ms\":%.6f,\"srtt_avg_ms\":%.6f}\n",
+        ",\"srtt_max_ms\":%.6f,\"srtt_avg_ms\":%.6f"
+        ",\"q_max\":%u,\"q_avg\":%.3f,\"q_p95\":%.1f,\"q_p99\":%.1f"
+        ",\"qdelay_avg_ms\":%.4f,\"qdelay_p50_ms\":%.4f,\"qdelay_p95_ms\":%.4f,\"qdelay_p99_ms\":%.4f,\"qdelay_max_ms\":%.4f"
+        ",\"owd_p50_ms\":%.4f,\"owd_p95_ms\":%.4f,\"owd_p99_ms\":%.4f,\"owd_max_ms\":%.4f"
+        ",\"rtt_p50_ms\":%.4f,\"rtt_p95_ms\":%.4f,\"rtt_p99_ms\":%.4f,\"rtt_max_ms\":%.4f}\n",
         queue_packets, vnet_queue_dropped, checksum_ok ? "true" : "false",
         sequence_ok ? "true" : "false", cleanup_ok ? "true" : "false",
         core_live, sscp_timer_tree.count, timeouts[0] + timeouts[1], retrans_packets,
         timeouts[0], timeouts[1],
-        (double)srtt_max / SSCP_TICK_SCALE, srtt_avg);
+        (double)srtt_max / SSCP_TICK_SCALE, srtt_avg,
+        vstats.q_max, vstats.q_avg, vstats.q_p95, vstats.q_p99,
+        vstats.qdelay_avg_ms, vstats.qdelay_p50_ms, vstats.qdelay_p95_ms, vstats.qdelay_p99_ms, vstats.qdelay_max_ms,
+        vstats.owd_p50_ms, vstats.owd_p95_ms, vstats.owd_p99_ms, vstats.owd_max_ms,
+        rtt_p50, rtt_p95, rtt_p99, rtt_pmax);
     printf("%s: received=%" PRIu64 " A=%016" PRIx64 " B=%016" PRIx64 " virtual_ms=%.3f dropped=%" PRIu64 "\n", ok ? "PASS" : "FAIL", received, hash_a, hash_b, (double)steps / SSCP_TICK_SCALE, vnet_dropped);
     fclose(summary);
     if (xpl_fp) {
