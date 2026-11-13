@@ -52,7 +52,7 @@ struct sscp_timer {
 #define RECV_WIN_INIT (1 << 24)
 #endif
 #ifndef CWND_WIN_MAX
-#define CWND_WIN_MAX  (4096 * 1460)
+#define CWND_WIN_MAX  (1 << 20)
 #endif
 #define MTU 1460
 #define PERSIST_INTERVAL (200U * (SSCP_TICK_SCALE))
@@ -82,7 +82,12 @@ struct sscp_buf {
     size_t len;
     uint32_t seq; // save it from hdr.
     uint64_t sent_time; // planned pacing send time, Q32.32 ticks
+    uint32_t booked_cwnd;
+    uint32_t tx_time;
+    double   budget_work;
     uint8_t dir:1;
+    uint8_t retransmitted:1;
+    uint8_t budget_in_win:1;
     uint8_t *data;
     uint32_t payload_off;
 };
@@ -131,7 +136,19 @@ enum sscp_cc_phase {
 
 enum sscp_cc_id {
     SSCP_CC_PROB = 0,
-    SSCP_CC_AIMD = 1
+    SSCP_CC_AIMD = 1,
+    SSCP_CC_CUBIC = 2
+};
+
+struct sscp_cubic_state {
+    uint8_t  epoch_active;
+    uint32_t epoch_start;
+    uint32_t w_last_max;
+    uint32_t w_max;
+    uint32_t origin_point;
+    double   k_sec;
+    double   w_est_bytes;
+    double   cwnd_frac;
 };
 
 struct sscp_stream {
@@ -220,21 +237,27 @@ struct sscp_stream {
     int32_t prob_gamma_q16;
     int32_t prob_beta_q16;
 
+    uint8_t  budget_pacing;
+    uint8_t  shadow_valid;
+    uint32_t budget_gain_q16;
+    uint32_t budget_next_tick;
+    uint32_t static_ss_gain_q16;
+    uint32_t static_ca_gain_q16;
+    uint32_t shadow_bytes;
+    uint32_t shadow_cwnd;
+    uint32_t shadow_cwnd_cnt;
+    uint32_t shadow_ssthresh;
+    struct sscp_buf *shadow_next;
+    double   slide_work;
+    struct sscp_cubic_state cubic;
+    struct sscp_cubic_state shadow_cubic;
+
     void (*cc_init)(struct sscp_stream *ss);
     void (*cc_on_ack)(struct sscp_stream *ss, uint32_t acked);
     uint32_t (*cc_on_rtt)(struct sscp_stream *ss);
     uint32_t (*cc_pacing_gain)(struct sscp_stream *ss);
     void (*cc_on_loss)(struct sscp_stream *ss);
     void (*cc_on_timeout)(struct sscp_stream *ss);
-
-    /* Adaptive Bisection Pacing (Research Branch) */
-    uint32_t pacing_gain_q16;
-    uint32_t pacing_mark_seq;
-    uint32_t pacing_w_start;
-    uint64_t pacing_round_start_time;
-    uint64_t pacing_round_end_time;
-    uint32_t pacing_round_pkts;
-    uint8_t  pacing_round_active;
 };
 
 /*

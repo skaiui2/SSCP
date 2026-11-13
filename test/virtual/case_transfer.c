@@ -147,7 +147,10 @@ int main(int argc, char **argv)
     const char *xpl_path = NULL;
     const char *csv_path = NULL;
     int start_ca = 0;
+    int budget_pacing = -1;
     uint32_t init_g_q16 = 0;
+    uint32_t static_ss_g_q16 = 0;
+    uint32_t static_ca_g_q16 = 0;
     int i, ok = 0, cc = SSCP_CC_AIMD;
     for (i = 1; i < argc; i += 2) {
         uint64_t value;
@@ -183,9 +186,13 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--start-ca")) start_ca = (int)value;
         else if (!strcmp(argv[i], "--init-g")) init_g_q16 = (uint32_t)value;
+        else if (!strcmp(argv[i], "--budget-pacing")) budget_pacing = (int)(value != 0);
+        else if (!strcmp(argv[i], "--ss-g")) static_ss_g_q16 = (uint32_t)value;
+        else if (!strcmp(argv[i], "--ca-g")) static_ca_g_q16 = (uint32_t)value;
         else return 2;
     }
-    if (!total || loss > 1000000 || !timeout || (cc != SSCP_CC_AIMD && cc != SSCP_CC_PROB)) return 2;
+    if (!total || loss > 1000000 || !timeout ||
+        (cc != SSCP_CC_AIMD && cc != SSCP_CC_PROB && cc != SSCP_CC_CUBIC)) return 2;
     summary = fopen("summary.json", "w");
     if (!summary) return 2;
     vnet_init(delay, rate, loss, seed);
@@ -213,16 +220,22 @@ int main(int argc, char **argv)
         a.stream->ssthresh = MSS;
         b.stream->cwnd = MSS;
         b.stream->ssthresh = MSS;
-        if (init_g_q16 > 0) {
-            a.stream->pacing_gain_q16 = init_g_q16;
-            b.stream->pacing_gain_q16 = init_g_q16;
-        } else {
-            a.stream->pacing_gain_q16 = 65536;
-            b.stream->pacing_gain_q16 = 65536;
-        }
-    } else if (init_g_q16 > 0) {
-        a.stream->pacing_gain_q16 = init_g_q16;
-        b.stream->pacing_gain_q16 = init_g_q16;
+    }
+    if (budget_pacing >= 0) {
+        a.stream->budget_pacing = (uint8_t)budget_pacing;
+        b.stream->budget_pacing = (uint8_t)budget_pacing;
+    }
+    if (init_g_q16 > 0) {
+        a.stream->budget_gain_q16 = init_g_q16;
+        b.stream->budget_gain_q16 = init_g_q16;
+    }
+    if (static_ss_g_q16 > 0) {
+        a.stream->static_ss_gain_q16 = static_ss_g_q16;
+        b.stream->static_ss_gain_q16 = static_ss_g_q16;
+    }
+    if (static_ca_g_q16 > 0) {
+        a.stream->static_ca_gain_q16 = static_ca_g_q16;
+        b.stream->static_ca_gain_q16 = static_ca_g_q16;
     }
     if (cc == SSCP_CC_PROB &&
         (sscp_prob_configure(a.stream, 100, 8000) || sscp_prob_configure(b.stream, 100, 8000))) return 2;
