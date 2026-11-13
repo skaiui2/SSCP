@@ -1618,7 +1618,7 @@ static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
         return (uint64_t)SSCP_TICK_SCALE << SSCP_PACING_SHIFT;
 
     rtt = ss->srtt;
-    if (ss->pacing_rttvar_q16 && ss->rttvar > 1 && ss->rttvar < (rtt >> 2)) {
+    if (ss->budget_pacing && ss->pacing_rttvar_q16 && ss->rttvar > 1 && ss->rttvar < (rtt >> 2)) {
         rtt += (uint32_t)(((uint64_t)ss->rttvar * ss->pacing_rttvar_q16) >> 16);
     }
     gain_q16 = ss->cc_pacing_gain(ss);
