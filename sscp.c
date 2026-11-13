@@ -6,7 +6,7 @@
 #include <math.h>
 
 static void sscp_send_window_probe(struct sscp_stream *ss);
-static void sscp_retransmit(struct sscp_stream *ss);
+static int sscp_retransmit(struct sscp_stream *ss);
 static int sscp_output(struct sscp_stream *ss);
 static void sscp_finish_close(struct sscp_stream *ss);
 static void sscp_pacing_timer_cb(void *arg);
@@ -620,7 +620,7 @@ static void sscp_send_window_probe(struct sscp_stream *ss)
  * Resend all bytes in [gap_start, gap_end) from snd_q.
  * rely on cwnd path for congestion control.
  */
-void sscp_retransmit_gap(struct sscp_stream *ss,
+int sscp_retransmit_gap(struct sscp_stream *ss,
                         uint32_t gap_start,
                         uint32_t gap_end)
 {
@@ -640,18 +640,24 @@ void sscp_retransmit_gap(struct sscp_stream *ss,
 
         // stop when segment starts after gap
         if (SEQ_GEQ(seg_start, gap_end))
-            return;
+            return sent_frags;
 
-        ss->loss_cnt++;
+        // RFC 6675: each lost segment is fast-retransmitted at most once; RTO recovers dropped rexmits.
+        if (sb->retransmitted)
+            continue;
+
         sb->retransmitted = 1;
+        ss->loss_cnt++;
         ss->shadow_valid = 0;
         sscp_output_data(ss, sb); 
         sent_frags++;
 
         if (sent_frags >= RETRANS_GAP_MAX)
-            return;
+            return sent_frags;
 
     }
+
+    return sent_frags;
 }
 
 /*
@@ -659,7 +665,7 @@ void sscp_retransmit_gap(struct sscp_stream *ss,
  * Only retransmit the first unacked segment (snd_una).
  * This avoids queue explosion and RTO storms.
  */
-static void sscp_retransmit(struct sscp_stream *ss)
+static int sscp_retransmit(struct sscp_stream *ss)
 {
     uint32_t max_frags = 1 << ss->rto_recovery;
 
@@ -679,15 +685,17 @@ static void sscp_retransmit(struct sscp_stream *ss)
         if (SEQ_LEQ(seg_end, ss->snd_una))
             continue;
 
-        ss->loss_cnt++;
         sb->retransmitted = 1;
+        ss->loss_cnt++;
         ss->shadow_valid = 0;
         sscp_output_data(ss, sb);
         sent++;
 
         if (sent >= max_frags)
-            return;
+            return (int)sent;
     }
+
+    return (int)sent;
 }
 
 /*
@@ -1144,6 +1152,8 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
     sscp_snd_buf_free(ss, ack);
 
+    int rexmit_sent = 0;
+
     if (sscp_sack_gap_valid(ss, ack, sack)) {
         int new_gap =
             !ss->last_gap_rexmit_valid ||
@@ -1152,19 +1162,10 @@ static void sscp_process_ack(struct sscp_stream *ss,
         if (new_gap) {
             sscp_enter_recovery(ss);
 
-            sscp_retransmit_gap(ss, ack, sack);
+            rexmit_sent += sscp_retransmit_gap(ss, ack, sack);
 
             ss->last_gap_rexmit_ack = ack;
             ss->last_gap_rexmit_valid = 1;
-
-            sscp_timer_delete(&ss->t_retrans);
-
-            if (ss->snd_una != ss->snd_nxt) {
-                sscp_timer_create(&ss->t_retrans,
-                                 sscp_timer_retrans_cb,
-                                 ss,
-                                 ss->rto);
-            }
         }
     }
 
@@ -1186,29 +1187,33 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
     // No new ACK: dupACK path 
     if (SEQ_LT(ss->snd_una, ss->snd_nxt)) {
-        ss->dup_acks++;
+        if (ss->dup_acks < UINT8_MAX)
+            ss->dup_acks++;
 
-        if (ss->dup_acks >= 3) {
+        if (ss->dup_acks >= 3 && !ss->fr_active) {
             sscp_enter_recovery(ss);
 
             if (sscp_sack_gap_valid(ss, ack, sack)) {
-                sscp_retransmit_gap(ss, ack, sack);
+                rexmit_sent += sscp_retransmit_gap(ss, ack, sack);
 
                 ss->last_gap_rexmit_ack = ack;
                 ss->last_gap_rexmit_valid = 1;
             }else {
-                sscp_retransmit(ss);
+                rexmit_sent += sscp_retransmit(ss);
             }
 
             ss->dup_acks = 0;
-            sscp_timer_delete(&ss->t_retrans);
+        }
+    }
 
-            if (ss->snd_una != ss->snd_nxt) {
-                sscp_timer_create(&ss->t_retrans,
-                                 sscp_timer_retrans_cb,
-                                 ss,
-                                 ss->rto);
-            }
+    if (rexmit_sent > 0) {
+        sscp_timer_delete(&ss->t_retrans);
+
+        if (ss->snd_una != ss->snd_nxt) {
+            sscp_timer_create(&ss->t_retrans,
+                             sscp_timer_retrans_cb,
+                             ss,
+                             ss->rto);
         }
     }
 
