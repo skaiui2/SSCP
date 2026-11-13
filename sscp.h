@@ -83,6 +83,7 @@ struct sscp_buf {
     uint32_t seq; // save it from hdr.
     uint64_t sent_time; // planned pacing send time, Q32.32 ticks
     uint8_t dir:1;
+    uint8_t retransmitted:1;
     uint8_t *data;
     uint32_t payload_off;
 };
