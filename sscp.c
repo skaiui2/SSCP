@@ -1031,9 +1031,10 @@ static void sscp_update_rtt(struct sscp_stream *s)
 {
     uint32_t rtt_sample = s->cc_on_rtt(s); 
     if (s->srtt == 0) {
-        s->srtt   = rtt_sample;
-        s->rttvar = rtt_sample >> 1;
-        s->rto    = s->srtt + (s->rttvar << 2);
+        s->srtt       = rtt_sample;
+        s->rttvar     = rtt_sample >> 1;
+        s->rtt_jitter = 0;
+        s->rto        = s->srtt + (s->rttvar << 2);
         if (s->rto < SSCP_RTO_MIN) s->rto = SSCP_RTO_MIN;
         if (s->rto > SSCP_RTO_MAX) s->rto = SSCP_RTO_MAX;
         return;
@@ -1046,11 +1047,13 @@ static void sscp_update_rtt(struct sscp_stream *s)
     int32_t abs_delta = delta >= 0 ? delta : -delta;
     int32_t rttvar_i  = (int32_t)s->rttvar;
     int32_t diff      = abs_delta - rttvar_i;
+    int32_t jitter_i  = (int32_t)s->rtt_jitter;
 
     rttvar_i = rttvar_i + (diff >> 2); 
     if (rttvar_i < 1) rttvar_i = 1;   
 
-    s->rttvar = (uint32_t)rttvar_i;
+    s->rttvar     = (uint32_t)rttvar_i;
+    s->rtt_jitter = (uint32_t)(jitter_i + ((abs_delta - jitter_i) >> 2));
 
     uint32_t rto = s->srtt + (s->rttvar << 2);
     if (rto < SSCP_RTO_MIN) rto = SSCP_RTO_MIN;
@@ -1300,7 +1303,7 @@ static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
     if (!ss->srtt)
         return (uint64_t)SSCP_TICK_SCALE << SSCP_PACING_SHIFT;
 
-    rtt = ss->srtt + min(ss->rttvar >> 1, ss->srtt >> 2);
+    rtt = ss->srtt + min(ss->rtt_jitter >> 1, ss->srtt >> 2);
     gain_q16 = ss->pacing_gain_q16;
     reciprocal_q32 = (uint64_t)SSCP_GAIN_ONE_Q16 << SSCP_PACING_SHIFT;
     reciprocal_q32 /= gain_q16;

@@ -165,7 +165,8 @@ struct sscp_stream {
     uint32_t rtt_sample;
     uint32_t srtt;                      // smoothed RTT
     uint32_t rtt_base;
-    uint32_t rttvar;                    // RTT variation
+    uint32_t rttvar;                    // RTT variation (RFC 6298, for RTO)
+    uint32_t rtt_jitter;                // smoothed |rtt_sample - srtt| for pacing
     uint32_t rto;                       // retransmission timeout
     uint32_t rto_recovery;
 
