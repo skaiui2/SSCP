@@ -380,7 +380,7 @@ int vnet_send(void *user, const void *buf, size_t len)
 
     channel_flush_buffer(channel, now_us, delay_us);
 
-    if (g_vnet.queue_limit && (channel->queued_packets >= g_vnet.queue_limit || vnet_pending >= g_vnet.queue_limit)) {
+    if (g_vnet.queue_limit && channel->queued_packets >= g_vnet.queue_limit) {
         ++vnet_dropped;
         ++vnet_queue_dropped;
         return (int)len;

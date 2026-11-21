@@ -55,6 +55,7 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
     if (len < sizeof(*h)) { sequence_ok = 0; return; }
     bytes = ntohs(h->len);
     seq = ntohl(h->seq);
+    s = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)1);
     if (event == VNET_SEND && (h->flags & SSCP_FLAG_DATA)) {
         if (!data_seen[direction]) {
             highest_seq[direction] = seq;
@@ -80,8 +81,9 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
                         t, start, t, end, t, start, t, end);
             }
             if (csv_fp) {
-                fprintf(csv_fp, "0,send,%u,%u,%u,0,%" PRIu32 ",%.3f\n",
-                        h->flags, bytes, seq, now, (double)now / SSCP_TICK_SCALE);
+                fprintf(csv_fp, "0,send,%u,%u,%u,0,%" PRIu32 ",%.3f,%u,%u,%u\n",
+                        h->flags, bytes, seq, now, (double)now / SSCP_TICK_SCALE,
+                        s ? s->cwnd : 0, s ? s->ssthresh : 0, s ? s->cc_pacing_gain(s) : 0);
             }
         }
     }
@@ -104,8 +106,9 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
                 xpl_has_prev_ack = 1;
             }
             if (csv_fp) {
-                fprintf(csv_fp, "1,arrival,%u,0,0,%u,%" PRIu32 ",%.3f\n",
-                        h->flags, ntohl(h->ack), now, (double)now / SSCP_TICK_SCALE);
+                fprintf(csv_fp, "1,arrival,%u,0,0,%u,%" PRIu32 ",%.3f,%u,%u,%u\n",
+                        h->flags, ntohl(h->ack), now, (double)now / SSCP_TICK_SCALE,
+                        s ? s->cwnd : 0, s ? s->ssthresh : 0, s ? s->cc_pacing_gain(s) : 0);
             }
         }
         s = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)1);
@@ -141,6 +144,7 @@ extern uint32_t sscp_now_time(void);
 int main(int argc, char **argv)
 {
     uint64_t total = UINT64_C(1073741824), sent = 0, received = 0, steps = 0;
+    uint64_t delivered_tick = 0;
     uint64_t hash_a = UINT64_C(14695981039346656037), hash_b = hash_a;
     uint32_t delay = 10, rate = 100, loss = 0, seed = 1, timeout = 36000000;
     uint32_t backlog = TRANSFER_SEND_BACKLOG_BYTES;
@@ -158,6 +162,8 @@ int main(int argc, char **argv)
     const char *xpl_path = NULL;
     const char *csv_path = NULL;
     int start_ca = 0;
+    uint32_t initial_ssthresh = 0;
+    uint32_t receive_window = 0;
     int budget_pacing = -1;
     uint32_t init_g_q16 = 0;
     uint32_t static_ss_g_q16 = 0;
@@ -197,6 +203,8 @@ int main(int argc, char **argv)
             backlog = (uint32_t)value;
         }
         else if (!strcmp(argv[i], "--start-ca")) start_ca = (int)value;
+        else if (!strcmp(argv[i], "--ssthresh-bytes")) { if (value > UINT32_MAX) return 2; initial_ssthresh = (uint32_t)value; }
+        else if (!strcmp(argv[i], "--receive-window-bytes")) { if (value > UINT32_MAX) return 2; receive_window = (uint32_t)value; }
         else if (!strcmp(argv[i], "--init-g")) init_g_q16 = (uint32_t)value;
         else if (!strcmp(argv[i], "--budget-pacing")) budget_pacing = (int)(value != 0);
         else if (!strcmp(argv[i], "--ss-g")) static_ss_g_q16 = (uint32_t)value;
@@ -222,7 +230,7 @@ int main(int argc, char **argv)
     if (csv_path) {
         csv_fp = fopen(csv_path, "w");
         if (csv_fp) {
-            fprintf(csv_fp, "direction,event,flags,payload_bytes,seq,ack,t_tick,t_ms\n");
+            fprintf(csv_fp, "direction,event,flags,payload_bytes,seq,ack,t_tick,t_ms,cwnd,ssthresh,gain_q16\n");
         }
     }
     if (sscp_init(16)) return 2;
@@ -233,6 +241,12 @@ int main(int argc, char **argv)
         a.stream->ssthresh = MSS;
         b.stream->cwnd = MSS;
         b.stream->ssthresh = MSS;
+    }
+    if (initial_ssthresh) {
+        a.stream->ssthresh = b.stream->ssthresh = initial_ssthresh;
+    }
+    if (receive_window) {
+        b.stream->sb_hiwat = b.stream->rcv_wnd = a.stream->snd_wnd = receive_window;
     }
     if (budget_pacing >= 0) {
         a.stream->budget_pacing = (uint8_t)budget_pacing;
@@ -267,6 +281,7 @@ int main(int argc, char **argv)
     while (steps < (uint64_t)timeout * SSCP_TICK_SCALE) {
         ++steps;
         if (vnet_step() || transfer_step(&a) || transfer_step(&b)) break;
+        if (!delivered_tick && b.received == total) delivered_tick = steps;
         check_sequences();
         if (!sequence_ok) break;
         if (a.done && b.done) { ok = 1; break; }
@@ -290,6 +305,9 @@ int main(int argc, char **argv)
     }
     free(rtt_arr); rtt_arr = NULL; rtt_cnt = rtt_cap = 0;
     fprintf(summary, "{\"success\":%s,\"requested_bytes\":%" PRIu64 ",\"accepted_bytes\":%" PRIu64 ",\"received_bytes\":%" PRIu64 ",\"checksum_algorithm\":\"FNV-1a-64\",\"checksum_a\":\"%016" PRIx64 "\",\"checksum_b\":\"%016" PRIx64 "\",\"simulated_ms\":%.3f,\"simulated_ticks\":%" PRIu64 ",\"tick_scale\":%u,\"cc\":%d,\"mbps\":%u,\"delay_ms\":%u,\"loss_ppm\":%u,\"seed\":%u,\"transport\":\"%s\",\"send_backlog_bytes\":%u,\"packets\":%" PRIu64 ",\"dropped\":%" PRIu64, ok ? "true" : "false", total, sent, received, hash_a, hash_b, (double)steps / SSCP_TICK_SCALE, steps, SSCP_TICK_SCALE, cc, rate, delay, loss, seed, rate ? "serialized_link" : "fixed_delay", backlog, vnet_packets, vnet_dropped);
+    fprintf(summary, ",\"receiver_complete_ms\":%.3f,\"data_fct_ms\":%.3f",
+        delivered_tick ? (double)delivered_tick / SSCP_TICK_SCALE : -1.0,
+        delivered_tick && xpl_first_tick >= 0 ? (double)(delivered_tick - (uint64_t)xpl_first_tick) / SSCP_TICK_SCALE : -1.0);
     fprintf(summary, ",\"queue_packets\":%u,\"queue_dropped\":%" PRIu64
         ",\"checksum_ok\":%s,\"sequence_ok\":%s,\"cleanup_ok\":%s"
         ",\"core_live_allocations\":%" PRId64 ",\"active_timers\":%u"

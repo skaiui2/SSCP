@@ -59,7 +59,18 @@ dkms.conf
 
 # Test artifacts
 /test/results/
+/results/
 **/__pycache__/
+
+# Paper drafts, LaTeX build intermediates & Overleaf bundles
+/papers/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
 
 *.pdf
 /jPlot.jar
