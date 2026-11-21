@@ -340,6 +340,8 @@ static void sscp_timer_retrans_cb(void *arg)
     ss->dup_acks = 0;
     ss->fr_active = 0;
     ss->recover_seq = 0;
+    ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
+    ss->pacing_next_tick = sscp_now_time();
 
     sscp_retransmit(ss);
 
@@ -981,6 +983,7 @@ void sscp_snd_buf_free(struct sscp_stream *ss, uint32_t ack)
         uint32_t end_seq     = sb->seq + payload_len;
 
         if (SEQ_LEQ(end_seq, ack)) {
+            ss->pacing_work_sum_q32 -= sb->pacing_work_q32;
             list_remove(cur);
             sscp_buf_free(ss, sb);
             ss->snd_q_count--;
@@ -1078,6 +1081,8 @@ static inline void sscp_enter_recovery(struct sscp_stream *ss)
 
     ss->fr_active = 1;
     ss->recover_seq = ss->snd_nxt;
+    ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
+    ss->pacing_next_tick = sscp_now_time();
 
     if (ss->cc_on_loss)
         ss->cc_on_loss(ss);
@@ -1117,7 +1122,21 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
     if (SEQ_GT(ack, old_una)) {
         uint32_t acked;
+        uint32_t now;
+
         acked = ack - old_una;
+        now = sscp_now_time();
+
+        if (!ss->fr_active && !ss->timeout_count &&
+            SEQ_GEQ(now, ss->pacing_next_tick)) {
+            uint64_t g;
+
+            g = (ss->pacing_work_sum_q32 + (1ULL << 15)) >> 16;
+            if (g < SSCP_GAIN_ONE_Q16)
+                g = SSCP_GAIN_ONE_Q16;
+            ss->pacing_gain_q16 = (uint32_t)g;
+            ss->pacing_next_tick = now + ss->srtt;
+        }
 
         sscp_update_loss(ss);    
 
@@ -1281,8 +1300,8 @@ static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
     if (!ss->srtt)
         return (uint64_t)SSCP_TICK_SCALE << SSCP_PACING_SHIFT;
 
-    rtt = ss->srtt;
-    gain_q16 = ss->cc_pacing_gain(ss);
+    rtt = ss->srtt + min(ss->rttvar >> 1, ss->srtt >> 2);
+    gain_q16 = ss->pacing_gain_q16;
     reciprocal_q32 = (uint64_t)SSCP_GAIN_ONE_Q16 << SSCP_PACING_SHIFT;
     reciprocal_q32 /= gain_q16;
 
@@ -1318,6 +1337,9 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
         if (!ss->pacing_next) {
             ss->pacing_next = sb;
         }
+
+        sb->pacing_work_q32 = ss->cc_pacing_work(ss, frag_len);
+        ss->pacing_work_sum_q32 += sb->pacing_work_q32;
 
         sb->sent_time = ss->pacing_next_time;
         ss->pacing_next_time += sscp_pacing_time(ss, frag_len);
@@ -1512,7 +1534,9 @@ int sscp_send(int fd, void *buf, size_t len)
 
         sb->len  = sizeof(struct sscp_hdr) + frag;
         sb->seq  = ss->snd_seq_q + (uint32_t)off;
+        sb->pacing_work_q32 = 0;
         sb->dir = SSCP_DIR_SEND;
+        sb->retransmitted = 0;
 
         uint8_t *pure = sb->data + sizeof(struct sscp_hdr);
         memcpy(pure, (uint8_t *)buf + off, frag);
@@ -2264,12 +2288,6 @@ static void sscp_update_cwnd_fast(struct sscp_stream *ss,
     ss->cwnd = (uint32_t)w;
 }
 
-static uint32_t sscp_prob_pacing_gain(struct sscp_stream *ss)
-{
-    (void)ss;
-    return SSCP_GAIN_CA_Q16;
-}
-
 static void sscp_prob_init(struct sscp_stream *ss)
 {
     ss->cwnd = MSS;
@@ -2320,11 +2338,10 @@ static uint32_t sscp_prob_on_rtt(struct sscp_stream *ss)
     return rtt;
 }
 
-static uint32_t sscp_aimd_pacing_gain(struct sscp_stream *ss)
+static uint64_t sscp_prob_pacing_work(struct sscp_stream *ss,
+                                      uint32_t frag_len)
 {
-    if (ss->cwnd < ss->ssthresh)
-        return SSCP_GAIN_SS_Q16;
-    return SSCP_GAIN_CA_Q16;
+    return ((uint64_t)frag_len << 32) / ss->cwnd;
 }
 
 static void sscp_aimd_init(struct sscp_stream *ss)
@@ -2411,6 +2428,40 @@ static uint32_t sscp_aimd_on_rtt(struct sscp_stream *ss)
     return ss->rtt_sample;
 }
 
+static uint64_t sscp_aimd_pacing_work(struct sscp_stream *ss,
+                                      uint32_t frag_len)
+{
+    uint32_t flight;
+    uint64_t w;
+    uint64_t next_w;
+    uint32_t dw;
+
+    flight = ss->schedule_next->seq - ss->snd_una;
+    w = ss->cwnd;
+    if (w < ss->ssthresh) {
+        uint32_t ss_room;
+
+        ss_room = ss->ssthresh - (uint32_t)w;
+        if (flight < ss_room) {
+            w += flight;
+            dw = frag_len;
+        } else {
+            w = ss->ssthresh +
+                ((uint64_t)(flight - ss_room) * MSS) / ss->ssthresh;
+            dw = (uint32_t)(((uint64_t)MSS * frag_len) / w);
+        }
+    } else {
+        w += ((uint64_t)flight * MSS) / w;
+        dw = (uint32_t)(((uint64_t)MSS * frag_len) / w);
+    }
+
+    w = min(w, (uint64_t)CWND_WIN_MAX);
+    next_w = min(w + dw, (uint64_t)CWND_WIN_MAX);
+    dw = min(ss->snd_wnd, (uint32_t)next_w) - min(ss->snd_wnd, (uint32_t)w);
+
+    return (((uint64_t)frag_len + (uint64_t)dw) << 32) / next_w;
+}
+
 static int sscp_install_cc(struct sscp_stream *ss,
                           enum sscp_cc_id cc_id)
 {
@@ -2419,21 +2470,21 @@ static int sscp_install_cc(struct sscp_stream *ss,
 
     switch (cc_id) {
     case SSCP_CC_PROB:
-        ss->cc_init       = sscp_prob_init;
-        ss->cc_on_ack     = sscp_prob_on_ack;
-        ss->cc_on_loss    = sscp_prob_on_loss;
-        ss->cc_on_timeout = sscp_prob_on_timeout;
-        ss->cc_on_rtt     = sscp_prob_on_rtt;
-        ss->cc_pacing_gain = sscp_prob_pacing_gain;
+        ss->cc_init        = sscp_prob_init;
+        ss->cc_on_ack      = sscp_prob_on_ack;
+        ss->cc_on_loss     = sscp_prob_on_loss;
+        ss->cc_on_timeout  = sscp_prob_on_timeout;
+        ss->cc_on_rtt      = sscp_prob_on_rtt;
+        ss->cc_pacing_work = sscp_prob_pacing_work;
         break;
 
     case SSCP_CC_AIMD:
-        ss->cc_init       = sscp_aimd_init;
-        ss->cc_on_ack     = sscp_aimd_on_ack;
-        ss->cc_on_loss    = sscp_aimd_on_loss;
-        ss->cc_on_timeout = sscp_aimd_on_timeout;
-        ss->cc_on_rtt     = sscp_aimd_on_rtt;
-        ss->cc_pacing_gain = sscp_aimd_pacing_gain;
+        ss->cc_init        = sscp_aimd_init;
+        ss->cc_on_ack      = sscp_aimd_on_ack;
+        ss->cc_on_loss     = sscp_aimd_on_loss;
+        ss->cc_on_timeout  = sscp_aimd_on_timeout;
+        ss->cc_on_rtt      = sscp_aimd_on_rtt;
+        ss->cc_pacing_work = sscp_aimd_pacing_work;
         break;
 
     default:
@@ -2441,6 +2492,9 @@ static int sscp_install_cc(struct sscp_stream *ss,
     }
 
     ss->cc_id = (uint8_t)cc_id;
+    ss->pacing_work_sum_q32 = 0;
+    ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
+    ss->pacing_next_tick = sscp_now_time();
 
     if (ss->cc_init)
         ss->cc_init(ss);
