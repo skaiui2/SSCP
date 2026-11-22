@@ -1150,7 +1150,11 @@ static void sscp_process_ack(struct sscp_stream *ss,
             ss->recover_seq = 0;
         }
 
-        if (ss->cc_on_ack)
+        /*
+         * RFC 5681 Sec 3.2 / RFC 6675 Sec 5: partial ACKs within a recovery
+         * episode (ack < recover_seq) must not trigger normal cwnd growth.
+         */
+        if (!ss->fr_active && ss->cc_on_ack)
             ss->cc_on_ack(ss, acked);
 
         ss->rto_recovery = 0;
@@ -2557,7 +2561,7 @@ static void sscp_cubic_on_ack(struct sscp_stream *ss,
     uint32_t inc;
     uint64_t next_cwnd;
 
-    if (acked == 0 || ss->fr_active)
+    if (acked == 0)
         return;
 
     if (ss->cwnd < ss->ssthresh) {
