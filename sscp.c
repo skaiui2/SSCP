@@ -2573,11 +2573,19 @@ static void sscp_cubic_on_ack(struct sscp_stream *ss,
         return;
 
     if (ss->cwnd < ss->ssthresh) {
-        next_cwnd = (uint64_t)ss->cwnd + (uint64_t)acked;
-        if (next_cwnd > CWND_WIN_MAX)
-            next_cwnd = CWND_WIN_MAX;
-        ss->cwnd = (uint32_t)next_cwnd;
-        return;
+        uint32_t thresh = ss->rtt_jitter << 2;
+        if (thresh < SSCP_TICK_SCALE)
+            thresh = SSCP_TICK_SCALE;
+        if (!ss->cubic_w_max && ss->cwnd >= 16U * MSS &&
+            ss->srtt > ss->rtt_base + thresh) {
+            ss->ssthresh = ss->cwnd;
+        } else {
+            next_cwnd = (uint64_t)ss->cwnd + (uint64_t)acked;
+            if (next_cwnd > CWND_WIN_MAX)
+                next_cwnd = CWND_WIN_MAX;
+            ss->cwnd = (uint32_t)next_cwnd;
+            return;
+        }
     }
 
     if (!ss->cubic_epoch_start) {
