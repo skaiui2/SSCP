@@ -1,0 +1,650 @@
+diff --git a/picoquic/cubic.c b/picoquic/cubic.c
+index ae4fe11..c9f1809 100644
+--- a/picoquic/cubic.c
++++ b/picoquic/cubic.c
+@@ -262,6 +262,7 @@ static void cubic_notify(
+     path_x->is_cc_data_updated = 1;
+ 
+     if (cubic_state != NULL) {
++        uint64_t prior_cwin = path_x->cwin;
+         switch (notification) {
+             /* RTT measurements will happen before acknowledgement is signalled */
+             case picoquic_congestion_notification_acknowledgement:
+@@ -441,6 +442,7 @@ static void cubic_notify(
+         }
+ 
+         /* Compute pacing data */
++        picoquic_budget_cc_event(path_x, notification, prior_cwin, current_time);
+         picoquic_update_pacing_data(path_x, cubic_state->alg_state == picoquic_cubic_alg_slow_start &&
+             cubic_state->ssthresh == UINT64_MAX);
+     }
+@@ -596,12 +598,80 @@ void cubic_observe(picoquic_path_t* path_x, uint64_t* cc_state, uint64_t* cc_par
+ #define picoquic_cubic_ID "cubic" /* CBIC */
+ #define picoquic_dcubic_ID "dcubic" /* DBIC */
+ 
++/* Estimate one-RTT CUBIC window growth in bytes for pacing-budget prediction. */
++static uint64_t cubic_budget_growth(
++    picoquic_path_t const* path_x,
++    uint64_t window,
++    uint64_t current_time)
++{
++    picoquic_cubic_state_t const* s =
++        (picoquic_cubic_state_t const*)path_x->congestion_alg_state;
++    uint64_t mss = path_x->send_mtu;
++    uint64_t rtt = (path_x->rtt_min != 0) ? path_x->rtt_min : path_x->smoothed_rtt;
++    int active = (s->alg_state == picoquic_cubic_alg_congestion_avoidance);
++    double remembered = s->W_max * (double)mss;
++    double origin = active ? remembered : (((double)window > remembered) ? (double)window : remembered);
++    double k = active ? s->K :
++        ((origin > (double)window) ? cubic_root((origin - (double)window) / (PICOQUIC_CUBIC_C * (double)mss)) : 0.0);
++    uint64_t elapsed = (active && current_time > s->start_of_epoch) ? (current_time - s->start_of_epoch) : 0;
++    double t = ((double)elapsed + (double)rtt) / 1000000.0 - k;
++    double reno = active ? s->W_reno : (double)window;
++    double w_cubic = origin + PICOQUIC_CUBIC_C * (double)mss * t * t * t;
++    double w_reno = reno + (double)((reno < origin) ? (9 * mss / 17) : mss);
++    double target = (w_cubic > w_reno) ? w_cubic : w_reno;
++    double growth;
++    double max_growth;
++
++    if (target <= (double)window) {
++        return mss / 100;
++    }
++    growth = target - (double)window;
++    max_growth = (double)(window / 2);
++    return (uint64_t)((growth < max_growth) ? growth : max_growth);
++}
++
++/* Predict one-packet ACK-clocked pacing work in Q32.32 fixed-point. */
++static uint64_t cubic_pacing_work(
++    picoquic_path_t const* path_x,
++    size_t length,
++    uint64_t current_time)
++{
++    picoquic_cubic_state_t const* s =
++        (picoquic_cubic_state_t const*)path_x->congestion_alg_state;
++    uint64_t w = path_x->cwin;
++    uint64_t flight = path_x->bytes_in_transit;
++    uint64_t threshold = s->ssthresh;
++    uint64_t room = (threshold > w) ? (threshold - w) : 0;
++    uint64_t dw = (uint64_t)length;
++    uint64_t denom;
++
++    if (w == 0 || path_x->send_mtu == 0) {
++        return 0;
++    }
++
++    if (flight < room) {
++        w += flight;
++    }
++    else {
++        uint64_t growth;
++        w += room;
++        growth = cubic_budget_growth(path_x, w, current_time);
++        w += (flight - room) * growth / w;
++        dw = (uint64_t)length * growth / w;
++    }
++
++    /* QUIC MAX_DATA is cumulative stream/connection credit, not a path window. */
++    denom = w + dw;
++    return (denom > 0) ? (((uint64_t)length + dw) << 32) / denom : 0;
++}
++
+ picoquic_congestion_algorithm_t picoquic_cubic_algorithm_struct = {
+     picoquic_cubic_ID, PICOQUIC_CC_ALGO_NUMBER_CUBIC, PICOQUIC_ECN_ECT_0,
+     cubic_init,
+     cubic_notify,
+     cubic_delete,
+-    cubic_observe
++    cubic_observe,
++    cubic_pacing_work
+ };
+ 
+ picoquic_congestion_algorithm_t picoquic_dcubic_algorithm_struct = {
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index db144b9..643bee5 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -3933,6 +3933,7 @@ static int picoquic_process_ack_range(
+                      * The handshake is complete, all the handshake packets are implicitly acknowledged */
+                     picoquic_ready_state_transition(cnx, current_time);
+                 }
++                picoquic_budget_acked(p, current_time);
+                 (void)picoquic_dequeue_retransmit_packet(cnx, pkt_ctx, p, 1, 0);
+                 p = next;
+             }
+diff --git a/picoquic/newreno.c b/picoquic/newreno.c
+index f022106..2525ab9 100644
+--- a/picoquic/newreno.c
++++ b/picoquic/newreno.c
+@@ -228,6 +228,7 @@ static void picoquic_newreno_notify(
+     path_x->is_cc_data_updated = 1;
+ 
+     if (nr_state != NULL) {
++        uint64_t prior_cwin = path_x->cwin;
+         switch (notification) {
+         /* RTT measurements will happen before acknowledgement is signalled */
+         case picoquic_congestion_notification_acknowledgement:
+@@ -297,6 +298,7 @@ static void picoquic_newreno_notify(
+         }
+ 
+         /* Compute pacing data */
++        picoquic_budget_cc_event(path_x, notification, prior_cwin, current_time);
+         picoquic_update_pacing_data(path_x, nr_state->nrss.alg_state == picoquic_newreno_alg_slow_start &&
+             nr_state->nrss.ssthresh == UINT64_MAX);
+     }
+@@ -320,6 +322,40 @@ void picoquic_newreno_observe(picoquic_path_t* path_x, uint64_t* cc_state, uint6
+     *cc_param = (nr_state->nrss.ssthresh == UINT64_MAX) ? 0 : nr_state->nrss.ssthresh;
+ }
+ 
++/* Predict one-packet ACK-clocked pacing work in Q32.32 fixed-point. */
++static uint64_t picoquic_newreno_pacing_work(
++    picoquic_path_t const* path_x,
++    size_t length,
++    uint64_t current_time)
++{
++    picoquic_newreno_state_t const* nr_state =
++        (picoquic_newreno_state_t const*)path_x->congestion_alg_state;
++    uint64_t w = path_x->cwin;
++    uint64_t flight = path_x->bytes_in_transit;
++    uint64_t threshold = nr_state->nrss.ssthresh;
++    uint64_t room = (threshold > w) ? (threshold - w) : 0;
++    uint64_t dw = (uint64_t)length;
++    uint64_t denom;
++
++    (void)current_time;
++    if (w == 0 || path_x->send_mtu == 0) {
++        return 0;
++    }
++
++    if (flight < room) {
++        w += flight;
++    }
++    else {
++        w += room;
++        w += (flight - room) * path_x->send_mtu / w;
++        dw = (uint64_t)length * path_x->send_mtu / w;
++    }
++
++    /* QUIC MAX_DATA is cumulative stream/connection credit, not a path window. */
++    denom = w + dw;
++    return (denom > 0) ? (((uint64_t)length + dw) << 32) / denom : 0;
++}
++
+ /* Definition record for the New Reno algorithm */
+ 
+ #define PICOQUIC_NEWRENO_ID "newreno" /* NR88 */
+@@ -329,7 +365,8 @@ picoquic_congestion_algorithm_t picoquic_newreno_algorithm_struct = {
+     picoquic_newreno_init,
+     picoquic_newreno_notify,
+     picoquic_newreno_delete,
+-    picoquic_newreno_observe
++    picoquic_newreno_observe,
++    picoquic_newreno_pacing_work
+ };
+ 
+ picoquic_congestion_algorithm_t* picoquic_newreno_algorithm = &picoquic_newreno_algorithm_struct;
+diff --git a/picoquic/pacing.c b/picoquic/pacing.c
+index d204b8d..e842919 100644
+--- a/picoquic/pacing.c
++++ b/picoquic/pacing.c
+@@ -23,6 +23,139 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#define PICOQUIC_ANALYTIC_SS_GAIN 1.38629436111989061883 /* 2 * ln(2) */
++
++static void picoquic_emit_pacing_trace(
++    picoquic_path_t* path_x,
++    uint64_t current_time,
++    int event_type,
++    size_t length,
++    uint64_t rate)
++{
++    if (path_x != NULL && path_x->cnx != NULL && path_x->cnx->quic != NULL &&
++        path_x->cnx->quic->pacing_trace_fn != NULL) {
++        path_x->cnx->quic->pacing_trace_fn(
++            path_x->cnx->quic->pacing_trace_ctx,
++            current_time,
++            event_type,
++            path_x->cwin,
++            path_x->bytes_in_transit,
++            path_x->smoothed_rtt,
++            path_x->rtt_variant,
++            length,
++            path_x->budget.raw_gain,
++            path_x->budget.gain_latched,
++            rate);
++    }
++}
++
++static int picoquic_budget_enabled(picoquic_path_t const* path_x)
++{
++    return path_x != NULL && path_x->cnx != NULL && path_x->cnx->quic != NULL &&
++        path_x->cnx->quic->pacing_mode == picoquic_pacing_mode_budget_o1 &&
++        !path_x->cnx->is_multipath_enabled;
++}
++
++void picoquic_budget_reset(picoquic_path_t* path_x)
++{
++    uint64_t generation;
++
++    if (path_x == NULL) {
++        return;
++    }
++    generation = path_x->budget.generation + 1;
++    memset(&path_x->budget, 0, sizeof(path_x->budget));
++    path_x->budget.generation = generation;
++    path_x->budget.gain_latched = 1.0;
++}
++
++void picoquic_budget_sent(picoquic_path_t* path_x, picoquic_packet_t* p, size_t length, uint64_t now)
++{
++    picoquic_congestion_algorithm_t const* cc;
++    uint64_t work;
++
++    p->pacing_work_q32 = 0;
++    if (!picoquic_budget_enabled(path_x) ||
++        p->ptype != picoquic_packet_1rtt_protected ||
++        p->is_mtu_probe || p->is_multipath_probe || length == 0 ||
++        !picoquic_is_packet_ack_eliciting(p) ||
++        path_x->congestion_alg_state == NULL ||
++        path_x->cwin == 0 || path_x->send_mtu == 0) {
++        return;
++    }
++
++    cc = path_x->cnx->congestion_alg;
++    if (cc == NULL || cc->alg_pacing_work == NULL) {
++        return;
++    }
++
++    work = cc->alg_pacing_work(path_x, length, now);
++    if (work != 0) {
++        p->pacing_work_q32 = work;
++        p->pacing_budget_generation = path_x->budget.generation;
++        path_x->budget.work_q32 += work;
++    }
++}
++
++void picoquic_budget_acked(picoquic_packet_t* p, uint64_t now)
++{
++    picoquic_path_t* path_x;
++    picoquic_budget_state_t* b;
++
++    if (p == NULL || p->send_path == NULL || p->pacing_work_q32 == 0 ||
++        p->pacing_budget_generation != p->send_path->budget.generation ||
++        !picoquic_is_packet_after_cc_reset(p)) {
++        return;
++    }
++
++    path_x = p->send_path;
++    b = &path_x->budget;
++    if (b->recovery_start != 0) {
++        if (p->send_time <= b->recovery_start) {
++            return;
++        }
++        b->recovery_start = 0;
++    }
++
++    if (now >= b->next_tick_time && path_x->smoothed_rtt != 0) {
++        uint64_t gain = (b->work_q32 + (1ULL << 15)) >> 16;
++        b->raw_gain = (double)gain / 65536.0;
++        b->gain_latched = (gain < 65536) ? 1.0 : b->raw_gain;
++        b->next_tick_time = now + path_x->smoothed_rtt;
++    }
++}
++
++void picoquic_budget_retire(picoquic_packet_t* p)
++{
++    if (p == NULL) {
++        return;
++    }
++    if (p->pacing_work_q32 != 0 && p->send_path != NULL &&
++        p->pacing_budget_generation == p->send_path->budget.generation &&
++        picoquic_is_packet_after_cc_reset(p)) {
++        if (p->send_path->budget.work_q32 >= p->pacing_work_q32) {
++            p->send_path->budget.work_q32 -= p->pacing_work_q32;
++        }
++        else {
++            p->send_path->budget.work_q32 = 0;
++        }
++    }
++    p->pacing_work_q32 = 0;
++}
++
++void picoquic_budget_cc_event(picoquic_path_t* path_x, picoquic_congestion_notification_t event,
++    uint64_t previous_cwin, uint64_t now)
++{
++    if (picoquic_budget_enabled(path_x) &&
++        (path_x->cwin < previous_cwin ||
++            event == picoquic_congestion_notification_timeout ||
++            event == picoquic_congestion_notification_persistent_congestion)) {
++        path_x->budget.recovery_start = now;
++        path_x->budget.gain_latched = 1.0;
++        path_x->budget.next_tick_time = now;
++    }
++}
++
+ 
+ /* Initialize pacing state to high speed default */
+ void picoquic_pacing_init(picoquic_pacing_t* pacing, uint64_t current_time)
+@@ -184,6 +317,77 @@ void picoquic_update_pacing_parameters(picoquic_pacing_t * pacing, double pacing
+     }
+ }
+ 
++static void picoquic_update_pacing_window_mode(
++    picoquic_pacing_t* pacing,
++    int slow_start,
++    uint64_t cwin,
++    size_t send_mtu,
++    uint64_t smoothed_rtt,
++    picoquic_path_t* signalled_path)
++{
++    uint64_t rtt_nanosec = smoothed_rtt * 1000;
++    uint64_t now = picoquic_get_quic_time(signalled_path->cnx->quic);
++    int pacing_mode = signalled_path->cnx->quic->pacing_mode;
++    double gain = 1.0;
++    double eff_rtt_us = (double)smoothed_rtt;
++    double pacing_rate;
++    uint64_t quantum;
++
++    /* Evaluation pacing modes: active for cwin >= 2*mtu with a fixed 2*mtu quantum. */
++    if (cwin < ((uint64_t)send_mtu) * 2 || rtt_nanosec <= 1000 || send_mtu == 0) {
++        pacing->bucket_max = rtt_nanosec;
++        pacing->packet_time_nanosec = 1;
++        pacing->packet_time_microsec = 1;
++        if (pacing->bucket_nanosec > pacing->bucket_max) {
++            pacing->bucket_nanosec = pacing->bucket_max;
++        }
++        picoquic_emit_pacing_trace(signalled_path, now,
++            picoquic_pacing_trace_window_update, 0, pacing->rate);
++        return;
++    }
++
++    switch (pacing_mode) {
++    case picoquic_pacing_mode_native_q2:
++        gain = slow_start ? 1.25 : 1.0;
++        break;
++    case picoquic_pacing_mode_static_1_0:
++        gain = 1.0;
++        break;
++    case picoquic_pacing_mode_rfc_2_0:
++        gain = slow_start ? 2.0 : 1.25;
++        break;
++    case picoquic_pacing_mode_analytical:
++        gain = slow_start ? PICOQUIC_ANALYTIC_SS_GAIN : 1.0;
++        break;
++    case picoquic_pacing_mode_linux_20_12:
++        gain = slow_start ? 2.0 : 1.20;
++        break;
++    case picoquic_pacing_mode_budget_o1:
++        if (picoquic_budget_enabled(signalled_path)) {
++            picoquic_budget_state_t const* b = &signalled_path->budget;
++            uint64_t margin = b->jitter / 2;
++            gain = (b->gain_latched > 1.0) ? b->gain_latched : 1.0;
++            eff_rtt_us += (double)((margin < smoothed_rtt / 4) ? margin : (smoothed_rtt / 4));
++        }
++        break;
++    default:
++        gain = 1.0;
++        break;
++    }
++
++    if (pacing_mode != picoquic_pacing_mode_budget_o1) {
++        signalled_path->budget.raw_gain = gain;
++        signalled_path->budget.gain_latched = gain;
++    }
++
++    pacing_rate = gain * ((double)cwin / (eff_rtt_us * 1000.0)) * 1000000000.0;
++    quantum = 2ull * (uint64_t)send_mtu;
++
++    picoquic_update_pacing_parameters(pacing, pacing_rate, quantum, send_mtu, smoothed_rtt, signalled_path);
++    picoquic_emit_pacing_trace(signalled_path, now,
++        picoquic_pacing_trace_window_update, 0, pacing->rate);
++}
++
+ /*
+ * Reset the pacing data after CWIN is updated.
+ * The max bucket is set to contain at least 2 packets more than 1/8th of the congestion window.
+@@ -194,6 +398,13 @@ void picoquic_update_pacing_window(picoquic_pacing_t * pacing, int slow_start, u
+ {
+     uint64_t rtt_nanosec = smoothed_rtt * 1000;
+ 
++    if (signalled_path != NULL && signalled_path->cnx != NULL &&
++        signalled_path->cnx->quic != NULL &&
++        signalled_path->cnx->quic->pacing_mode != picoquic_pacing_mode_native) {
++        picoquic_update_pacing_window_mode(pacing, slow_start, cwin, send_mtu, smoothed_rtt, signalled_path);
++        return;
++    }
++
+     if ((cwin < ((uint64_t)send_mtu) * 8) || rtt_nanosec <= 1000) {
+         /* Small windows, should only relie on ACK clocking */
+         pacing->bucket_max = rtt_nanosec;
+@@ -235,6 +446,11 @@ void picoquic_update_pacing_window(picoquic_pacing_t * pacing, int slow_start, u
+         }
+         picoquic_update_pacing_parameters(pacing, pacing_rate, quantum, send_mtu, smoothed_rtt, signalled_path);
+     }
++
++    if (signalled_path != NULL && signalled_path->cnx != NULL && signalled_path->cnx->quic != NULL) {
++        picoquic_emit_pacing_trace(signalled_path, picoquic_get_quic_time(signalled_path->cnx->quic),
++            picoquic_pacing_trace_window_update, 0, pacing->rate);
++    }
+ }
+ 
+ /* 
+@@ -253,6 +469,8 @@ void picoquic_update_pacing_data_after_send(picoquic_pacing_t * pacing, size_t l
+ void picoquic_update_pacing_after_send(picoquic_path_t* path_x, size_t length, uint64_t current_time)
+ {
+     picoquic_update_pacing_data_after_send(&path_x->pacing, length, path_x->send_mtu, current_time);
++    picoquic_emit_pacing_trace(path_x, current_time, picoquic_pacing_trace_packet_sent,
++        length, path_x->pacing.rate);
+ }
+ 
+ int picoquic_is_sending_authorized_by_pacing(picoquic_cnx_t* cnx, picoquic_path_t* path_x, uint64_t current_time, uint64_t* next_time)
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index b83aade..ef2802d 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1865,6 +1865,8 @@ typedef void (*picoquic_congestion_algorithm_notify)(
+ typedef void (*picoquic_congestion_algorithm_delete)(picoquic_path_t* cnx);
+ typedef void (*picoquic_congestion_algorithm_observe)(
+     picoquic_path_t* path_x, uint64_t * cc_state, uint64_t * cc_param);
++typedef uint64_t (*picoquic_congestion_algorithm_pacing_work)(
++    picoquic_path_t const* path_x, size_t length, uint64_t current_time);
+ 
+ typedef struct st_picoquic_congestion_algorithm_t {
+     char const * congestion_algorithm_id;
+@@ -1874,6 +1876,7 @@ typedef struct st_picoquic_congestion_algorithm_t {
+     picoquic_congestion_algorithm_notify alg_notify;
+     picoquic_congestion_algorithm_delete alg_delete;
+     picoquic_congestion_algorithm_observe alg_observe;
++    picoquic_congestion_algorithm_pacing_work alg_pacing_work;
+ } picoquic_congestion_algorithm_t;
+ 
+ #define PICOQUIC_DEFAULT_CONGESTION_ALGORITHM picoquic_newreno_algorithm;
+@@ -1980,6 +1983,39 @@ uint64_t picoquic_get_pacing_rate(picoquic_cnx_t* cnx);
+ uint64_t picoquic_get_cwin(picoquic_cnx_t* cnx);
+ uint64_t picoquic_get_rtt(picoquic_cnx_t* cnx);
+ 
++/* Pacing modes and optional trace callback for BudgetO1 evaluation */
++typedef enum {
++    picoquic_pacing_mode_native = 0,
++    picoquic_pacing_mode_static_1_0 = 1,
++    picoquic_pacing_mode_rfc_2_0 = 2,
++    picoquic_pacing_mode_analytical = 3,
++    picoquic_pacing_mode_budget_o1 = 4,
++    picoquic_pacing_mode_linux_20_12 = 5,
++    picoquic_pacing_mode_native_q2 = 6
++} picoquic_pacing_mode_enum;
++
++typedef enum {
++    picoquic_pacing_trace_window_update = 0,
++    picoquic_pacing_trace_packet_sent = 1
++} picoquic_pacing_trace_event_enum;
++
++typedef void (*picoquic_pacing_trace_fn)(
++    void* trace_ctx,
++    uint64_t current_time,
++    int event_type,
++    uint64_t cwin,
++    uint64_t bytes_in_transit,
++    uint64_t smoothed_rtt,
++    uint64_t rtt_variant,
++    size_t length,
++    double raw_gain,
++    double latched_gain,
++    uint64_t pacing_rate);
++
++void picoquic_set_pacing_mode(picoquic_quic_t* quic, int pacing_mode);
++int picoquic_get_pacing_mode(picoquic_quic_t* quic);
++void picoquic_set_pacing_trace(picoquic_quic_t* quic, picoquic_pacing_trace_fn trace_fn, void* trace_ctx);
++
+ /* List of ALPN types used in session negotiation */
+ 
+ typedef enum {
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+index 1e1ba15..7ed65ea 100644
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -347,6 +347,8 @@ typedef struct st_picoquic_packet_t {
+     uint64_t delivered_sent_prior;
+     uint64_t lost_prior;
+     uint64_t inflight_prior;
++    uint64_t pacing_work_q32;
++    uint64_t pacing_budget_generation;
+     size_t data_repeat_frame;
+     size_t data_repeat_index;
+ 
+@@ -611,6 +613,9 @@ typedef struct st_picoquic_quic_t {
+ 
+     picoquic_congestion_algorithm_t const* default_congestion_alg;
+     char const* default_congestion_alg_option_string;
++    int pacing_mode;
++    picoquic_pacing_trace_fn pacing_trace_fn;
++    void* pacing_trace_ctx;
+ 
+     struct st_picoquic_cnx_t* cnx_list;
+     struct st_picoquic_cnx_t* cnx_last;
+@@ -985,6 +990,16 @@ typedef struct st_picoquic_pacing_t {
+     int64_t packet_time_nanosec;
+ } picoquic_pacing_t;
+ 
++typedef struct st_picoquic_budget_state_t {
++    uint64_t generation;
++    uint64_t work_q32;
++    uint64_t next_tick_time;
++    uint64_t recovery_start;
++    uint64_t jitter;
++    double raw_gain;
++    double gain_latched;
++} picoquic_budget_state_t;
++
+ /* Tuple context.
+ * Tuple context are created to hold address and port pairs used to contact peers.
+ * Address pairs are "verified" by successful path challenge/response exchanges.
+@@ -1179,6 +1194,7 @@ typedef struct st_picoquic_path_t {
+     uint64_t last_cwin_blocked_time;
+     uint64_t last_time_acked_data_frame_sent;
+     void* congestion_alg_state;
++    picoquic_budget_state_t budget;
+     picoquic_pacing_t pacing;
+     uint64_t cc_reset_pn; /* Application packets numbered below this were sent before the last CC reset */
+ 
+@@ -1772,6 +1788,12 @@ void picoquic_update_pacing_after_send(picoquic_path_t* path_x, size_t length, u
+ int picoquic_is_sending_authorized_by_pacing(picoquic_cnx_t* cnx, picoquic_path_t* path_x, uint64_t current_time, uint64_t* next_time);
+ /* Reset pacing data if congestion algorithm computes it directly */
+ void picoquic_update_pacing_rate(picoquic_path_t* path_x, double pacing_rate, uint64_t quantum);
++void picoquic_budget_reset(picoquic_path_t* path_x);
++void picoquic_budget_sent(picoquic_path_t* path_x, picoquic_packet_t* p, size_t length, uint64_t now);
++void picoquic_budget_acked(picoquic_packet_t* p, uint64_t now);
++void picoquic_budget_retire(picoquic_packet_t* p);
++void picoquic_budget_cc_event(picoquic_path_t* path_x, picoquic_congestion_notification_t event,
++    uint64_t previous_cwin, uint64_t now);
+ /* Manage path quality updates */
+ void picoquic_refresh_path_quality_thresholds(picoquic_path_t* path_x);
+ int picoquic_issue_path_quality_update(picoquic_cnx_t* cnx, picoquic_path_t* path_x);
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index e5c6fc3..7cce9b6 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -3099,6 +3099,7 @@ void picoquic_reset_path_congestion(picoquic_cnx_t* cnx, picoquic_path_t* path_x
+     path_x->max_sample_delivered = 0;
+     path_x->cwin = PICOQUIC_CWIN_INITIAL;
+     picoquic_pacing_init(&path_x->pacing, current_time);
++    picoquic_budget_reset(path_x);
+     if (cnx->congestion_alg != NULL) {
+         picoquic_per_ack_state_t ack_state = { 0 };
+         cnx->congestion_alg->alg_notify(cnx, path_x, picoquic_congestion_notification_reset,
+@@ -5322,6 +5323,7 @@ void picoquic_set_congestion_algorithm_ex(picoquic_cnx_t* cnx, picoquic_congesti
+         if (cnx->path != NULL) {
+             for (int i = 0; i < cnx->nb_paths; i++) {
+                 cnx->congestion_alg->alg_init(cnx->path[i], alg_option_string, picoquic_get_quic_time(cnx->quic));
++                picoquic_budget_reset(cnx->path[i]);
+             }
+         }
+     }
+@@ -5350,6 +5352,28 @@ void picoquic_request_forced_probe_up(picoquic_cnx_t* cnx, unsigned int request_
+     cnx->is_forced_probe_up_required = request_forced_probe_up;
+ }
+ 
++void picoquic_set_pacing_mode(picoquic_quic_t* quic, int pacing_mode)
++{
++    if (quic != NULL) {
++        PICOQUIC_THREAD_CHECK(quic);
++        quic->pacing_mode = pacing_mode;
++    }
++}
++
++int picoquic_get_pacing_mode(picoquic_quic_t* quic)
++{
++    return (quic != NULL) ? quic->pacing_mode : picoquic_pacing_mode_native;
++}
++
++void picoquic_set_pacing_trace(picoquic_quic_t* quic, picoquic_pacing_trace_fn trace_fn, void* trace_ctx)
++{
++    if (quic != NULL) {
++        PICOQUIC_THREAD_CHECK(quic);
++        quic->pacing_trace_fn = trace_fn;
++        quic->pacing_trace_ctx = trace_ctx;
++    }
++}
++
+ void picoquic_subscribe_pacing_rate_updates(picoquic_cnx_t* cnx, uint64_t decrease_threshold, uint64_t increase_threshold)
+ {
+     PICOQUIC_THREAD_CHECK(cnx->quic);
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+index 3c929f2..878c5f3 100644
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -695,6 +695,7 @@ void picoquic_queue_for_retransmit(picoquic_cnx_t* cnx, picoquic_path_t * path_x
+ 
+     if (!packet->is_ack_trap) {
+         /* Account for bytes in transit, for congestion control */
++        picoquic_budget_sent(path_x, packet, length, current_time);
+         path_x->bytes_in_transit += length;
+         path_x->is_cc_data_updated = 1;
+         if (path_x->bytes_in_transit >= path_x->cwin) {
+@@ -712,6 +713,7 @@ picoquic_packet_t* picoquic_dequeue_retransmit_packet(picoquic_cnx_t* cnx,
+     int add_to_data_repeat_queue)
+ {
+     size_t dequeued_length = p->length + p->checksum_overhead;
++    picoquic_budget_retire(p);
+ 
+     if (p->is_queued_for_retransmit) {
+         /* Remove from list */
+diff --git a/picoquic/timing.c b/picoquic/timing.c
+index 0458089..ee9861b 100644
+--- a/picoquic/timing.c
++++ b/picoquic/timing.c
+@@ -204,6 +204,12 @@ void picoquic_update_path_rtt(picoquic_cnx_t* cnx, picoquic_path_t* old_path, in
+                 }
+             }
+         }
++        if (!is_first && rtt_estimate != 0 &&
++            cnx->quic->pacing_mode == picoquic_pacing_mode_budget_o1) {
++            int64_t delta = (int64_t)rtt_estimate - (int64_t)old_path->smoothed_rtt;
++            int64_t error = (delta >= 0) ? delta : -delta;
++            old_path->budget.jitter += (error - (int64_t)old_path->budget.jitter) >> 2;
++        }
+         old_path->rtt_sample = rtt_estimate;
+         /* During a measurement period, accumulate data:
+         * - number of estimates since update

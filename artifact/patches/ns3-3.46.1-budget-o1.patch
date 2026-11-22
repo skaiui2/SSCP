@@ -1,0 +1,628 @@
+--- a/src/internet/model/tcp-congestion-ops.h
++++ b/src/internet/model/tcp-congestion-ops.h
+@@ -182,6 +182,17 @@
+                              const TcpRateOps::TcpRateConnection& rc,
+                              const TcpRateOps::TcpRateSample& rs);
+ 
++    /**
++     * @brief Estimate one-RTT congestion window growth in bytes for pacing budget
++     *
++     * Default AIMD/Reno congestion avoidance grows by one MSS per RTT.
++     *
++     * @param tcb internal congestion state
++     * @param window predicted congestion window in bytes
++     * @return estimated one-RTT window growth in bytes
++     */
++    virtual uint32_t PacingGrowth(Ptr<const TcpSocketState> tcb, uint32_t window) const;
++
+     // Present in Linux but not in ns-3 yet:
+     /* call when ack arrives (optional) */
+     //     void (*in_ack_event)(struct sock *sk, u32 flags);
+--- a/src/internet/model/tcp-congestion-ops.cc
++++ b/src/internet/model/tcp-congestion-ops.cc
+@@ -76,6 +76,12 @@
+     NS_LOG_FUNCTION(this << tcb);
+ }
+ 
++uint32_t
++TcpCongestionOps::PacingGrowth(Ptr<const TcpSocketState> tcb, uint32_t /* window */) const
++{
++    return tcb->m_segmentSize;
++}
++
+ // RENO
+ 
+ NS_OBJECT_ENSURE_REGISTERED(TcpNewReno);
+--- a/src/internet/model/tcp-socket-base.h
++++ b/src/internet/model/tcp-socket-base.h
+@@ -20,6 +20,7 @@
+ #include "ns3/timer.h"
+ #include "ns3/traced-value.h"
+ 
++#include <deque>
+ #include <queue>
+ #include <stdint.h>
+ 
+@@ -1452,6 +1453,21 @@
+         m_rxTrace; //!< Trace of received packets
+ 
+     // Pacing related variable
++    struct BudgetEntry
++    {
++        SequenceNumber32 end;
++        uint64_t work;
++    };
++
++    uint64_t PacingWork(SequenceNumber32 seq, uint32_t length) const;
++    void AckPacingWork(SequenceNumber32 ack);
++    bool m_budgetPacing{false};
++    std::deque<BudgetEntry> m_pacingWork;
++    uint64_t m_pacingWorkSum{0};
++    Time m_budgetNextTick;
++    Time m_pacingJitter;
++    TracedValue<double> m_budgetGain{1.0};
++
+     Timer m_pacingTimer{Timer::CANCEL_ON_DESTROY}; //!< Pacing Event
+ 
+     // Parameters related to Explicit Congestion Notification
+--- a/src/internet/model/tcp-socket-base.cc
++++ b/src/internet/model/tcp-socket-base.cc
+@@ -194,6 +194,15 @@
+                                           "On",
+                                           TcpSocketState::AcceptOnly,
+                                           "AcceptOnly"))
++            .AddAttribute("BudgetPacing",
++                          "Enable the SSCP-style ACK work budget for Reno or CUBIC.",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&TcpSocketBase::m_budgetPacing),
++                          MakeBooleanChecker())
++            .AddTraceSource("BudgetGain",
++                            "Published gain used by budget pacing.",
++                            MakeTraceSourceAccessor(&TcpSocketBase::m_budgetGain),
++                            "ns3::TracedValueCallback::Double")
+             .AddTraceSource("RTO",
+                             "Retransmission timeout",
+                             MakeTraceSourceAccessor(&TcpSocketBase::m_rto),
+@@ -400,6 +409,7 @@
+       m_isFirstPartialAck(sock.m_isFirstPartialAck),
+       m_txTrace(sock.m_txTrace),
+       m_rxTrace(sock.m_rxTrace),
++      m_budgetPacing(sock.m_budgetPacing),
+       m_pacingTimer(Timer::CANCEL_ON_DESTROY),
+       m_ecnEchoSeq(sock.m_ecnEchoSeq),
+       m_ecnCESeq(sock.m_ecnCESeq),
+@@ -1675,6 +1685,11 @@
+ TcpSocketBase::EnterRecovery(uint32_t currentDelivered)
+ {
+     NS_LOG_FUNCTION(this);
++    if (m_budgetPacing)
++    {
++        m_budgetGain = 1.0;
++        m_budgetNextTick = Simulator::Now();
++    }
+     NS_ASSERT(m_tcb->m_congState != TcpSocketState::CA_RECOVERY);
+ 
+     NS_LOG_DEBUG(TcpSocketState::TcpCongStateName[m_tcb->m_congState] << " -> CA_RECOVERY");
+@@ -1883,6 +1898,10 @@
+         }
+     }
+ 
++    if (m_budgetPacing && ackNumber > oldHeadSequence)
++    {
++        AckPacingWork(ackNumber);
++    }
+     m_txBuffer->DiscardUpTo(ackNumber, MakeCallback(&TcpRateOps::SkbDelivered, m_rateOps));
+ 
+     auto currentDelivered =
+@@ -3195,6 +3214,17 @@
+     uint8_t flags = withAck ? TcpHeader::ACK : 0;
+     uint32_t remainingData = m_txBuffer->SizeFromSequence(seq + SequenceNumber32(sz));
+ 
++    if (m_budgetPacing)
++    {
++        UpdatePacingRate();
++    }
++    if (m_budgetPacing && !isRetransmission && sz > 0)
++    {
++        const uint64_t work = PacingWork(seq, sz);
++        m_pacingWork.push_back({seq + SequenceNumber32(sz), work});
++        m_pacingWorkSum += work;
++    }
++
+     // TCP sender should not send data out of the window advertised by the
+     // peer when it is not retransmission.
+     NS_ASSERT(isRetransmission ||
+@@ -3792,6 +3822,11 @@
+ 
+     if (!rtt.IsZero())
+     {
++        if (m_budgetPacing && m_rtt->GetNSamples() > 0)
++        {
++            const Time error = Abs(rtt - m_rtt->GetEstimate());
++            m_pacingJitter += (error - m_pacingJitter) / 4;
++        }
+         m_rtt->Measurement(rtt); // Log the measurement
+         // RFC 6298, clause 2.4
+         m_rto = Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4),
+@@ -3877,6 +3912,12 @@
+         return;
+     }
+ 
++    if (m_budgetPacing)
++    {
++        m_budgetGain = 1.0;
++        m_budgetNextTick = Simulator::Now();
++    }
++
+     // Retransmit non-data packet: Only if in FIN_WAIT_1 or CLOSING state
+     if (m_txBuffer->Size() == 0)
+     {
+@@ -4716,6 +4757,64 @@
+     return false;
+ }
+ 
++uint64_t
++TcpSocketBase::PacingWork(SequenceNumber32 seq, uint32_t length) const
++{
++    const uint32_t cwnd = m_tcb->m_cWnd;
++    if (cwnd == 0 || length == 0)
++    {
++        return 0;
++    }
++
++    const uint32_t flight = seq - m_txBuffer->HeadSequence();
++    const uint32_t threshold = m_tcb->m_ssThresh;
++    const uint32_t ssRoom = threshold > cwnd ? threshold - cwnd : 0;
++    uint64_t window = cwnd;
++    uint64_t growth = length;
++    if (flight < ssRoom)
++    {
++        window += flight;
++    }
++    else
++    {
++        window += ssRoom;
++        const uint32_t dwRtt =
++            m_congestionControl ? m_congestionControl->PacingGrowth(m_tcb, window) : m_tcb->m_segmentSize;
++        window += uint64_t(flight - ssRoom) * dwRtt / window;
++        growth = uint64_t(length) * dwRtt / window;
++    }
++
++    const uint64_t rwnd = m_rWnd.Get();
++    const uint64_t next = window + growth;
++    if (next == 0)
++    {
++        return 0;
++    }
++    const uint64_t usable = std::min(rwnd, next) - std::min(rwnd, window);
++    return ((uint64_t(length) + usable) << 32) / next;
++}
++
++void
++TcpSocketBase::AckPacingWork(SequenceNumber32 ack)
++{
++    const Time now = Simulator::Now();
++    const Time srtt = m_tcb->m_srtt;
++    const auto state = m_tcb->m_congState.Get();
++    if ((state == TcpSocketState::CA_OPEN || state == TcpSocketState::CA_DISORDER) &&
++        srtt.IsStrictlyPositive() && now >= m_budgetNextTick)
++    {
++        const uint64_t gain = (m_pacingWorkSum + (1ULL << 15)) >> 16;
++        m_budgetGain = std::max<uint64_t>(gain, 65536) / 65536.0;
++        m_budgetNextTick = now + srtt;
++    }
++    while (!m_pacingWork.empty() && m_pacingWork.front().end <= ack)
++    {
++        const uint64_t work = m_pacingWork.front().work;
++        m_pacingWorkSum = (m_pacingWorkSum >= work) ? (m_pacingWorkSum - work) : 0;
++        m_pacingWork.pop_front();
++    }
++}
++
+ void
+ TcpSocketBase::UpdatePacingRate()
+ {
+@@ -4738,6 +4837,19 @@
+         return;
+     }
+ 
++    if (m_budgetPacing)
++    {
++        const Time srtt = m_tcb->m_srtt;
++        if (srtt.IsStrictlyPositive())
++        {
++            const Time rtt = srtt + std::min(m_pacingJitter / 2, srtt / 4);
++            const double rate = 8.0 * m_tcb->m_cWnd.Get() * m_budgetGain.Get() / rtt.GetSeconds();
++            m_tcb->m_pacingRate = DataRate(std::clamp(
++                rate, 1.0, double(m_tcb->m_maxPacingRate.GetBitRate())));
++        }
++        return;
++    }
++
+     double factor;
+     if (m_tcb->m_cWnd < m_tcb->m_ssThresh / 2)
+     {
+--- a/src/internet/model/tcp-cubic.h
++++ b/src/internet/model/tcp-cubic.h
+@@ -89,6 +89,9 @@
+     void CongestionStateSet(Ptr<TcpSocketState> tcb,
+                             const TcpSocketState::TcpCongState_t newState) override;
+ 
++    /** Estimate one-RTT window growth in bytes for the pacing budget. */
++    uint32_t PacingGrowth(Ptr<const TcpSocketState> tcb, uint32_t window) const override;
++
+     Ptr<TcpCongestionOps> Fork() override;
+     void Init(Ptr<TcpSocketState> tcb) override;
+ 
+--- a/src/internet/model/tcp-cubic.cc
++++ b/src/internet/model/tcp-cubic.cc
+@@ -500,6 +500,28 @@
+     m_found = false;
+ }
+ 
++uint32_t
++TcpCubic::PacingGrowth(Ptr<const TcpSocketState> tcb, uint32_t window) const
++{
++    const uint32_t mss = tcb->m_segmentSize;
++    const bool active = m_epochStart != Time::Min();
++    const uint64_t origin = active ? uint64_t(m_bicOriginPoint) * mss
++                                   : std::max<uint64_t>(window, uint64_t(m_lastMaxCwnd) * mss);
++    const double k = active ? m_bicK : std::cbrt((origin - window) / (m_c * mss));
++    const Time rtt = tcb->m_minRtt == Time::Max() ? tcb->m_srtt.Get() : tcb->m_minRtt;
++    const Time elapsed = active ? std::max(Time(), Simulator::Now() - m_epochStart) : Time();
++    const double t = (elapsed + rtt).GetSeconds() - k;
++    const uint64_t reno = active ? uint64_t(m_tcpCwnd) * mss : window;
++    const double target =
++        std::max(origin + m_c * mss * t * t * t,
++                 double(reno + (reno < origin ? 9U * mss / 17U : mss)));
++    if (target <= window)
++    {
++        return mss / 100U;
++    }
++    return static_cast<uint32_t>(std::min(target - window, double(window / 2)));
++}
++
+ Ptr<TcpCongestionOps>
+ TcpCubic::Fork()
+ {
+--- /dev/null
++++ b/scratch/budget-experiment.cc
+@@ -0,0 +1,338 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "ns3/applications-module.h"
++#include "ns3/core-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/network-module.h"
++#include "ns3/point-to-point-module.h"
++#include "ns3/traffic-control-module.h"
++
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <limits>
++#include <string>
++
++using namespace ns3;
++
++namespace
++{
++constexpr double APP_START = 0.1;
++constexpr uint32_t MSS = 1430;
++
++struct Observation
++{
++    std::ofstream events;
++    uint64_t target{0};
++    uint64_t rxBytes{0};
++    uint64_t txDataPackets{0};
++    uint64_t drops{0};
++    uint64_t tcDrops{0};
++    double firstData{-1.0};
++    double completeAt{-1.0};
++
++    void Row(const std::string& event,
++             uint32_t seq = 0,
++             uint32_t bytes = 0,
++             double v1 = 0.0,
++             double v2 = 0.0,
++             uint32_t flag = 0)
++    {
++        events << Simulator::Now().GetSeconds() << ',' << event << ',' << seq << ',' << bytes
++               << ',' << v1 << ',' << v2 << ',' << flag << '\n';
++    }
++};
++
++void
++Tx(Observation* observation,
++   Ptr<const Packet> packet,
++   const TcpHeader& header,
++   Ptr<const TcpSocketBase> socket)
++{
++    (void)socket;
++    observation->Row("tx",
++                     header.GetSequenceNumber().GetValue(),
++                     packet->GetSize(),
++                     header.GetAckNumber().GetValue(),
++                     0.0,
++                     header.GetFlags());
++    if (packet->GetSize() != 0)
++    {
++        ++observation->txDataPackets;
++        if (observation->firstData < 0)
++        {
++            observation->firstData = Simulator::Now().GetSeconds();
++        }
++    }
++}
++
++void
++Rx(Observation* observation,
++   Ptr<const Packet> packet,
++   const TcpHeader& header,
++   Ptr<const TcpSocketBase> socket)
++{
++    (void)socket;
++    observation->Row((header.GetFlags() & TcpHeader::ACK) ? "rx_ack" : "rx_control",
++                     header.GetAckNumber().GetValue(),
++                     packet->GetSize(),
++                     header.GetSequenceNumber().GetValue(),
++                     0.0,
++                     header.GetFlags());
++}
++
++void
++Uint(Observation* observation, std::string event, uint32_t oldValue, uint32_t newValue)
++{
++    observation->Row(event, 0, 0, newValue, oldValue);
++}
++
++void
++Double(Observation* observation, std::string event, double oldValue, double newValue)
++{
++    observation->Row(event, 0, 0, newValue, oldValue);
++}
++
++void
++Rtt(Observation* observation, Time oldValue, Time newValue)
++{
++    observation->Row("srtt", 0, 0, newValue.GetSeconds(), oldValue.GetSeconds());
++}
++
++void
++Congestion(Observation* observation,
++           TcpSocketState::TcpCongState_t oldValue,
++           TcpSocketState::TcpCongState_t newValue)
++{
++    observation->Row("state", 0, 0, newValue, oldValue);
++}
++
++void
++Deliver(Observation* observation, Ptr<const Packet> packet, const Address& from)
++{
++    (void)from;
++    observation->rxBytes += packet->GetSize();
++    observation->Row("deliver", 0, packet->GetSize(), observation->rxBytes);
++    if (observation->completeAt < 0 && observation->rxBytes >= observation->target)
++    {
++        observation->completeAt = Simulator::Now().GetSeconds();
++    }
++}
++
++void
++Drop(Observation* observation, uint32_t direction, Ptr<const Packet> packet)
++{
++    ++observation->drops;
++    observation->Row("drop", 0, packet->GetSize(), direction);
++}
++
++void
++TcDrop(Observation* observation, uint32_t node, Ptr<const Packet> packet)
++{
++    ++observation->tcDrops;
++    observation->Row("tc_drop", 0, packet->GetSize(), node);
++}
++
++void
++Attach(Observation* observation, Ptr<BulkSendApplication> source)
++{
++    Ptr<Socket> socket = source->GetSocket();
++    NS_ABORT_MSG_IF(!socket, "BulkSend did not create its native TCP socket");
++    auto connect = [&](const std::string& name, const CallbackBase& callback) {
++        NS_ABORT_MSG_IF(!socket->TraceConnectWithoutContext(name, callback),
++                        "Missing TCP trace: " << name);
++    };
++    connect("Tx", MakeBoundCallback(&Tx, observation));
++    connect("Rx", MakeBoundCallback(&Rx, observation));
++    connect("CongestionWindow", MakeBoundCallback(&Uint, observation, std::string("cwnd")));
++    connect("BytesInFlight", MakeBoundCallback(&Uint, observation, std::string("flight")));
++    connect("SlowStartThreshold", MakeBoundCallback(&Uint, observation, std::string("ssthresh")));
++    connect("CongState", MakeBoundCallback(&Congestion, observation));
++    connect("RTT", MakeBoundCallback(&Rtt, observation));
++    connect("BudgetGain", MakeBoundCallback(&Double, observation, std::string("gain")));
++}
++} // namespace
++
++int
++main(int argc, char* argv[])
++{
++    std::string outDir = "data/run";
++    std::string cc = "reno";
++    std::string policy = "budget";
++    std::string bottleneckRate = "100Mbps";
++    double delayMs = 50.0;
++    uint32_t queuePackets = 100;
++    uint64_t maxBytes = 16u * 1024u * 1024u;
++    uint32_t iw = 1;
++    uint32_t ssThresh = std::numeric_limits<uint32_t>::max();
++    double stopTime = 120.0;
++    CommandLine command(__FILE__);
++    command.AddValue("outDir", "Directory for raw TCP events and summary", outDir);
++    command.AddValue("cc", "Native congestion control: reno or cubic", cc);
++    command.AddValue("policy", "Pacing policy: budget, analytic, linux, static1", policy);
++    command.AddValue("bottleneckRate", "Rate of both bottleneck directions", bottleneckRate);
++    command.AddValue("delayMs", "Total one-way propagation delay in milliseconds", delayMs);
++    command.AddValue("queuePackets", "Bottleneck device queue capacity in packets", queuePackets);
++    command.AddValue("maxBytes", "Application transfer size in bytes", maxBytes);
++    command.AddValue("iw", "Initial congestion window in MSS", iw);
++    command.AddValue("ssThresh", "Initial slow-start threshold in bytes", ssThresh);
++    command.AddValue("stopTime", "Simulation stop time in seconds", stopTime);
++    command.Parse(argc, argv);
++    NS_ABORT_MSG_IF(cc != "reno" && cc != "cubic", "cc must be reno or cubic");
++    NS_ABORT_MSG_IF(policy != "budget" && policy != "analytic" && policy != "linux" && policy != "static1",
++                    "policy must be budget, analytic, linux, or static1 (native ratios use integer percent)");
++    NS_ABORT_MSG_IF(delayMs <= 0 || queuePackets == 0 || maxBytes == 0 || iw == 0 ||
++                        stopTime <= APP_START,
++                    "Positive delay, queue size, transfer size, initial window and duration required");
++
++    Config::SetDefault("ns3::TcpL4Protocol::SocketType",
++                       TypeIdValue(cc == "reno" ? TcpLinuxReno::GetTypeId() : TcpCubic::GetTypeId()));
++    Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(MSS));
++    Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(iw));
++    Config::SetDefault("ns3::TcpSocket::InitialSlowStartThreshold", UintegerValue(ssThresh));
++    Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(64u * 1024u * 1024u));
++    Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(64u * 1024u * 1024u));
++    Config::SetDefault("ns3::TcpSocket::TcpNoDelay", BooleanValue(true));
++    Config::SetDefault("ns3::TcpSocket::DelAckCount", UintegerValue(1));
++    Config::SetDefault("ns3::TcpSocketState::EnablePacing", BooleanValue(true));
++    Config::SetDefault("ns3::TcpSocketState::PaceInitialWindow", BooleanValue(true));
++    Config::SetDefault("ns3::TcpSocketState::PacingSsRatio",
++                       UintegerValue(policy == "static1" ? 100 : (policy == "analytic" ? 139 : 200)));
++    Config::SetDefault("ns3::TcpSocketState::PacingCaRatio",
++                       UintegerValue(policy == "linux" ? 120 : 100));
++    Config::SetDefault("ns3::TcpSocketBase::BudgetPacing", BooleanValue(policy == "budget"));
++
++    std::filesystem::create_directories(outDir);
++    Observation observation;
++    observation.target = maxBytes;
++    observation.events.open(outDir + "/events.csv");
++    NS_ABORT_MSG_IF(!observation.events, "Cannot open events.csv");
++    observation.events << std::setprecision(17)
++                       << "t_s,event,seq,bytes,v1,v2,flag\n";
++
++    NodeContainer nodes;
++    nodes.Create(3);
++    InternetStackHelper internet;
++    internet.Install(nodes);
++    PointToPointHelper access;
++    access.SetDeviceAttribute("DataRate", StringValue("100Gbps"));
++    access.SetChannelAttribute("Delay", TimeValue(Seconds(delayMs / 2000.0)));
++    access.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize("1000000p")));
++    NetDeviceContainer accessDevices = access.Install(nodes.Get(0), nodes.Get(1));
++    PointToPointHelper bottleneck;
++    bottleneck.SetDeviceAttribute("DataRate", StringValue(bottleneckRate));
++    bottleneck.SetChannelAttribute("Delay", TimeValue(Seconds(delayMs / 2000.0)));
++    bottleneck.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize",
++                        QueueSizeValue(QueueSize(std::to_string(queuePackets) + "p")));
++    NetDeviceContainer bottleneckDevices = bottleneck.Install(nodes.Get(1), nodes.Get(2));
++    Ipv4AddressHelper addresses;
++    addresses.SetBase("10.70.1.0", "255.255.255.0");
++    addresses.Assign(accessDevices);
++    addresses.SetBase("10.70.2.0", "255.255.255.0");
++    Ipv4InterfaceContainer right = addresses.Assign(bottleneckDevices);
++    TrafficControlHelper traffic;
++    traffic.Uninstall(accessDevices);
++    traffic.Uninstall(bottleneckDevices);
++    for (uint32_t i = 0; i < nodes.GetN(); ++i)
++    {
++        auto layer = nodes.Get(i)->GetObject<TrafficControlLayer>();
++        NS_ABORT_MSG_IF(!layer->TraceConnectWithoutContext(
++                            "TcDrop", MakeBoundCallback(&TcDrop, &observation, i)),
++                        "Missing TrafficControl drop trace");
++    }
++    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
++    for (uint32_t i = 0; i < bottleneckDevices.GetN(); ++i)
++    {
++        auto device = DynamicCast<PointToPointNetDevice>(bottleneckDevices.Get(i));
++        NS_ABORT_MSG_IF(!device->GetQueue()->TraceConnectWithoutContext(
++                            "Drop", MakeBoundCallback(&Drop, &observation, i)),
++                        "Missing device queue Drop trace");
++    }
++
++    constexpr uint16_t PORT = 4242;
++    PacketSinkHelper sink("ns3::TcpSocketFactory",
++                          InetSocketAddress(Ipv4Address::GetAny(), PORT));
++    ApplicationContainer sinks = sink.Install(nodes.Get(2));
++    sinks.Start(Seconds(0));
++    auto packetSink = DynamicCast<PacketSink>(sinks.Get(0));
++    NS_ABORT_MSG_IF(!packetSink->TraceConnectWithoutContext(
++                        "Rx", MakeBoundCallback(&Deliver, &observation)),
++                    "Missing PacketSink delivery trace");
++    BulkSendHelper bulk("ns3::TcpSocketFactory", InetSocketAddress(right.GetAddress(1), PORT));
++    bulk.SetAttribute("MaxBytes", UintegerValue(maxBytes));
++    ApplicationContainer sources = bulk.Install(nodes.Get(0));
++    sources.Start(Seconds(APP_START));
++    auto source = DynamicCast<BulkSendApplication>(sources.Get(0));
++    // The SYN is sent at APP_START; attach before its ACK can return on these links.
++    Simulator::Schedule(Seconds(APP_START) + TimeStep(1), &Attach, &observation, source);
++    Simulator::Stop(Seconds(stopTime));
++    Simulator::Run();
++
++    bool complete = observation.rxBytes >= maxBytes;
++    std::ofstream summary(outDir + "/summary.json");
++    summary << std::setprecision(17)
++            << "{\n  \"cc\": " << std::quoted(cc)
++            << ",\n  \"policy\": " << std::quoted(policy)
++            << ",\n  \"bottleneck_rate\": " << std::quoted(bottleneckRate)
++            << ",\n  \"one_way_propagation_ms\": " << delayMs
++            << ",\n  \"base_rtt_ms\": " << 2 * delayMs
++            << ",\n  \"queue_packets\": " << queuePackets
++            << ",\n  \"max_bytes\": " << maxBytes
++            << ",\n  \"mss_bytes\": " << MSS
++            << ",\n  \"iw_mss\": " << iw
++            << ",\n  \"initial_ssthresh_bytes\": " << ssThresh
++            << ",\n  \"delack_count\": 1,\n  \"sndbuf_bytes\": 67108864,\n  \"rcvbuf_bytes\": 67108864"
++            << ",\n  \"app_start_s\": " << APP_START
++            << ",\n  \"trace_attach_s\": " << (Seconds(APP_START) + TimeStep(1)).GetSeconds()
++            << ",\n  \"rx_bytes\": " << observation.rxBytes
++            << ",\n  \"tx_data_packets\": " << observation.txDataPackets
++            << ",\n  \"queue_drops\": " << observation.drops
++            << ",\n  \"device_queue_drops\": " << observation.drops
++            << ",\n  \"tc_drops\": " << observation.tcDrops
++            << ",\n  \"total_drops\": " << observation.drops + observation.tcDrops
++            << ",\n  \"complete\": " << (complete ? "true" : "false")
++            << ",\n  \"fct_s\": ";
++    if (complete)
++    {
++        summary << observation.completeAt - APP_START;
++    }
++    else
++    {
++        summary << "null";
++    }
++    summary << ",\n  \"first_data_s\": ";
++    if (observation.firstData >= 0)
++    {
++        summary << observation.firstData;
++    }
++    else
++    {
++        summary << "null";
++    }
++    summary << ",\n  \"complete_at_s\": ";
++    if (complete)
++    {
++        summary << observation.completeAt;
++    }
++    else
++    {
++        summary << "null";
++    }
++    summary << ",\n  \"data_fct_s\": ";
++    if (complete && observation.firstData >= 0)
++    {
++        summary << observation.completeAt - observation.firstData;
++    }
++    else
++    {
++        summary << "null";
++    }
++    summary << ",\n  \"simulated_until_s\": " << Simulator::Now().GetSeconds() << "\n}\n";
++    std::cout << "complete=" << complete << " rx_bytes=" << observation.rxBytes
++              << " tx_data_packets=" << observation.txDataPackets
++              << " queue_drops=" << observation.drops << '\n';
++    std::cout << "tc_drops=" << observation.tcDrops
++              << " total_drops=" << observation.drops + observation.tcDrops << '\n';
++    Simulator::Destroy();
++    return complete ? 0 : 2;
++}
