@@ -83,7 +83,7 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
             if (csv_fp) {
                 fprintf(csv_fp, "0,send,%u,%u,%u,0,%" PRIu32 ",%.3f,%u,%u,%u\n",
                         h->flags, bytes, seq, now, (double)now / SSCP_TICK_SCALE,
-                        s ? s->cwnd : 0, s ? s->ssthresh : 0, s ? s->cc_pacing_gain(s) : 0);
+                        s ? s->cwnd : 0, s ? s->ssthresh : 0, s ? s->pacing_gain_q16 : 0);
             }
         }
     }
@@ -108,7 +108,7 @@ static void observe(unsigned direction, int event, const void *buf, size_t len, 
             if (csv_fp) {
                 fprintf(csv_fp, "1,arrival,%u,0,0,%u,%" PRIu32 ",%.3f,%u,%u,%u\n",
                         h->flags, ntohl(h->ack), now, (double)now / SSCP_TICK_SCALE,
-                        s ? s->cwnd : 0, s ? s->ssthresh : 0, s ? s->cc_pacing_gain(s) : 0);
+                        s ? s->cwnd : 0, s ? s->ssthresh : 0, s ? s->pacing_gain_q16 : 0);
             }
         }
         s = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)1);
@@ -253,8 +253,8 @@ int main(int argc, char **argv)
         b.stream->budget_pacing = (uint8_t)budget_pacing;
     }
     if (init_g_q16 > 0) {
-        a.stream->budget_gain_q16 = init_g_q16;
-        b.stream->budget_gain_q16 = init_g_q16;
+        a.stream->pacing_gain_q16 = init_g_q16;
+        b.stream->pacing_gain_q16 = init_g_q16;
     }
     if (static_ss_g_q16 > 0) {
         a.stream->static_ss_gain_q16 = static_ss_g_q16;

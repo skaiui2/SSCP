@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
 
 static void sscp_send_window_probe(struct sscp_stream *ss);
 static int sscp_retransmit(struct sscp_stream *ss);
@@ -11,7 +10,6 @@ static int sscp_output(struct sscp_stream *ss);
 static void sscp_finish_close(struct sscp_stream *ss);
 static void sscp_pacing_timer_cb(void *arg);
 static void sscp_pacing_send_due(struct sscp_stream *ss);
-static void sscp_budget_slide_tx(struct sscp_stream *ss, struct sscp_buf *sb, uint32_t now);
 static int sscp_install_cc(struct sscp_stream *ss,
                           enum sscp_cc_id cc_id);
 void sscp_output_data(struct sscp_stream *ss, struct sscp_buf *sb);
@@ -342,7 +340,8 @@ static void sscp_timer_retrans_cb(void *arg)
     ss->dup_acks = 0;
     ss->fr_active = 0;
     ss->recover_seq = 0;
-    ss->shadow_valid = 0;
+    ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
+    ss->pacing_next_tick = sscp_now_time();
 
     sscp_retransmit(ss);
 
@@ -622,7 +621,8 @@ static void sscp_send_window_probe(struct sscp_stream *ss)
  */
 int sscp_retransmit_gap(struct sscp_stream *ss,
                         uint32_t gap_start,
-                        uint32_t gap_end)
+                        uint32_t gap_end,
+                        int max_frags)
 {
     struct list_node *n;
     int sent_frags = 0;
@@ -648,11 +648,10 @@ int sscp_retransmit_gap(struct sscp_stream *ss,
 
         sb->retransmitted = 1;
         ss->loss_cnt++;
-        ss->shadow_valid = 0;
         sscp_output_data(ss, sb); 
         sent_frags++;
 
-        if (sent_frags >= RETRANS_GAP_MAX)
+        if (sent_frags >= max_frags)
             return sent_frags;
 
     }
@@ -687,7 +686,6 @@ static int sscp_retransmit(struct sscp_stream *ss)
 
         sb->retransmitted = 1;
         ss->loss_cnt++;
-        ss->shadow_valid = 0;
         sscp_output_data(ss, sb);
         sent++;
 
@@ -986,10 +984,7 @@ void sscp_snd_buf_free(struct sscp_stream *ss, uint32_t ack)
         uint32_t end_seq     = sb->seq + payload_len;
 
         if (SEQ_LEQ(end_seq, ack)) {
-            if (sb == ss->shadow_next) {
-                ss->shadow_next = NULL;
-                ss->shadow_valid = 0;
-            }
+            ss->pacing_work_sum_q32 -= sb->pacing_work_q32;
             list_remove(cur);
             sscp_buf_free(ss, sb);
             ss->snd_q_count--;
@@ -1037,9 +1032,10 @@ static void sscp_update_rtt(struct sscp_stream *s)
 {
     uint32_t rtt_sample = s->cc_on_rtt(s); 
     if (s->srtt == 0) {
-        s->srtt   = rtt_sample;
-        s->rttvar = rtt_sample >> 1;
-        s->rto    = s->srtt + (s->rttvar << 2);
+        s->srtt       = rtt_sample;
+        s->rttvar     = rtt_sample >> 1;
+        s->rtt_jitter = 0;
+        s->rto        = s->srtt + (s->rttvar << 2);
         if (s->rto < SSCP_RTO_MIN) s->rto = SSCP_RTO_MIN;
         if (s->rto > SSCP_RTO_MAX) s->rto = SSCP_RTO_MAX;
         return;
@@ -1052,11 +1048,13 @@ static void sscp_update_rtt(struct sscp_stream *s)
     int32_t abs_delta = delta >= 0 ? delta : -delta;
     int32_t rttvar_i  = (int32_t)s->rttvar;
     int32_t diff      = abs_delta - rttvar_i;
+    int32_t jitter_i  = (int32_t)s->rtt_jitter;
 
     rttvar_i = rttvar_i + (diff >> 2); 
     if (rttvar_i < 1) rttvar_i = 1;   
 
-    s->rttvar = (uint32_t)rttvar_i;
+    s->rttvar     = (uint32_t)rttvar_i;
+    s->rtt_jitter = (uint32_t)(jitter_i + ((abs_delta - jitter_i) >> 2));
 
     uint32_t rto = s->srtt + (s->rttvar << 2);
     if (rto < SSCP_RTO_MIN) rto = SSCP_RTO_MIN;
@@ -1087,7 +1085,8 @@ static inline void sscp_enter_recovery(struct sscp_stream *ss)
 
     ss->fr_active = 1;
     ss->recover_seq = ss->snd_nxt;
-    ss->shadow_valid = 0;
+    ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
+    ss->pacing_next_tick = sscp_now_time();
 
     if (ss->cc_on_loss)
         ss->cc_on_loss(ss);
@@ -1127,7 +1126,21 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
     if (SEQ_GT(ack, old_una)) {
         uint32_t acked;
+        uint32_t now;
+
         acked = ack - old_una;
+        now = sscp_now_time();
+
+        if (!ss->fr_active && !ss->timeout_count &&
+            SEQ_GEQ(now, ss->pacing_next_tick)) {
+            uint64_t g;
+
+            g = (ss->pacing_work_sum_q32 + (1ULL << 15)) >> 16;
+            if (g < SSCP_GAIN_ONE_Q16)
+                g = SSCP_GAIN_ONE_Q16;
+            ss->pacing_gain_q16 = (uint32_t)g;
+            ss->pacing_next_tick = now + ss->srtt;
+        }
 
         sscp_update_loss(ss);    
 
@@ -1137,7 +1150,11 @@ static void sscp_process_ack(struct sscp_stream *ss,
             ss->recover_seq = 0;
         }
 
-        if (ss->cc_on_ack)
+        /*
+         * RFC 5681 Sec 3.2 / RFC 6675 Sec 5: partial ACKs within a recovery
+         * episode (ack < recover_seq) must not trigger normal cwnd growth.
+         */
+        if (!ss->fr_active && ss->cc_on_ack)
             ss->cc_on_ack(ss, acked);
 
         ss->rto_recovery = 0;
@@ -1162,10 +1179,17 @@ static void sscp_process_ack(struct sscp_stream *ss,
         if (new_gap) {
             sscp_enter_recovery(ss);
 
-            rexmit_sent += sscp_retransmit_gap(ss, ack, sack);
+            rexmit_sent += sscp_retransmit_gap(ss, ack, sack, RETRANS_GAP_MAX);
 
             ss->last_gap_rexmit_ack = ack;
             ss->last_gap_rexmit_valid = 1;
+        } else if (ss->fr_active) {
+            /*
+             * RFC 6675 Sec 5 (NextSeg / packet conservation): each subsequent
+             * SACK indicates one segment left the pipe, clocking out at most
+             * 1 un-retransmitted segment from [ack, sack) without burst storm.
+             */
+            rexmit_sent += sscp_retransmit_gap(ss, ack, sack, 1);
         }
     }
 
@@ -1194,7 +1218,7 @@ static void sscp_process_ack(struct sscp_stream *ss,
             sscp_enter_recovery(ss);
 
             if (sscp_sack_gap_valid(ss, ack, sack)) {
-                rexmit_sent += sscp_retransmit_gap(ss, ack, sack);
+                rexmit_sent += sscp_retransmit_gap(ss, ack, sack, RETRANS_GAP_MAX);
 
                 ss->last_gap_rexmit_ack = ack;
                 ss->last_gap_rexmit_valid = 1;
@@ -1259,7 +1283,6 @@ void sscp_output_ack(struct sscp_stream *ss, struct sscp_hdr *data_sh)
 void sscp_output_data(struct sscp_stream *ss, struct sscp_buf *sb)
 {
     struct sscp_hdr *hdr = (struct sscp_hdr *)sb->data;
-    uint32_t now = sscp_now_time();
 
     hdr->seq   = htonl(sb->seq);
     hdr->ack   = htonl(ss->rcv_nxt);
@@ -1268,8 +1291,7 @@ void sscp_output_data(struct sscp_stream *ss, struct sscp_buf *sb)
     hdr->len   = htons((uint16_t)sb->len - sizeof(struct sscp_hdr));
     hdr->flags = SSCP_FLAG_DATA;
     hdr->fd    = ss->dst_fd;
-    hdr->time_val  = htonl(now);
-    sb->tx_time = now;
+    hdr->time_val  = htonl(sscp_now_time());
 
     hdr->cksum = 0;
     hdr->cksum = in_checksum(sb->data, sb->len);
@@ -1281,340 +1303,12 @@ void sscp_output_data(struct sscp_stream *ss, struct sscp_buf *sb)
     ss->packet_count++;
     ss->packet_bytes += sb->len - sizeof(struct sscp_hdr);
     ss->sent_cnt++;
-    sscp_budget_slide_tx(ss, sb, now);
-}
-
-static void sscp_reno_step_ack(uint32_t *cwnd,
-                               uint32_t *cwnd_cnt,
-                               uint32_t ssthresh,
-                               uint32_t acked)
-{
-    uint64_t next_cwnd;
-
-    if (acked == 0)
-        return;
-
-    if (*cwnd < ssthresh) {
-        next_cwnd = (uint64_t)(*cwnd) + (uint64_t)acked;
-    } else {
-        uint64_t numerator =
-            (uint64_t)MSS * (uint64_t)acked + *cwnd_cnt;
-        uint32_t inc =
-            (uint32_t)(numerator / (*cwnd ? *cwnd : 1U));
-
-        *cwnd_cnt = (uint32_t)(numerator - (uint64_t)inc * (*cwnd));
-        next_cwnd = (uint64_t)(*cwnd) + inc;
-    }
-
-    if (next_cwnd > CWND_WIN_MAX)
-        next_cwnd = CWND_WIN_MAX;
-    if (next_cwnd < MSS)
-        next_cwnd = MSS;
-
-    *cwnd = (uint32_t)next_cwnd;
-}
-
-static void sscp_cubic_step_ack(uint32_t *cwnd,
-                                uint32_t ssthresh,
-                                struct sscp_cubic_state *cubic,
-                                uint32_t now_tick,
-                                uint32_t rtt_ticks,
-                                uint32_t acked)
-{
-    double hz;
-    double d_cwnd;
-    double t_sec;
-    double rtt_sec;
-    double dt;
-    double w_max_pkts;
-    double w_cubic_bytes;
-    double target;
-    double alpha;
-    double inc_cubic;
-    double inc_est;
-    double inc;
-    double next_d;
-    uint32_t next_cwnd;
-
-    if (acked == 0)
-        return;
-
-    if (*cwnd < ssthresh) {
-        uint64_t next = (uint64_t)(*cwnd) + (uint64_t)acked;
-        if (next > CWND_WIN_MAX)
-            next = CWND_WIN_MAX;
-        if (next < MSS)
-            next = MSS;
-        *cwnd = (uint32_t)next;
-        cubic->cwnd_frac = 0.0;
-        return;
-    }
-
-    if (!cubic->epoch_active) {
-        cubic->epoch_active = 1;
-        cubic->epoch_start = now_tick;
-        cubic->cwnd_frac = 0.0;
-        if (cubic->w_max <= *cwnd) {
-            cubic->k_sec = 0.0;
-            cubic->origin_point = *cwnd;
-            cubic->w_max = *cwnd;
-        } else {
-            double diff_pkts = (double)(cubic->w_max - *cwnd) / (double)MSS;
-            cubic->k_sec = cbrt(diff_pkts / 0.4);
-            cubic->origin_point = *cwnd;
-        }
-        cubic->w_est_bytes = (double)(*cwnd);
-    }
-
-    hz = 1000.0 * (double)SSCP_TICK_SCALE;
-    t_sec = (double)(int32_t)(now_tick - cubic->epoch_start) / hz;
-    if (t_sec < 0.0)
-        t_sec = 0.0;
-    rtt_sec = rtt_ticks ? ((double)rtt_ticks / hz) : 0.001;
-
-    dt = (t_sec + rtt_sec) - cubic->k_sec;
-    w_max_pkts = (double)cubic->w_max / (double)MSS;
-    w_cubic_bytes = (0.4 * dt * dt * dt + w_max_pkts) * (double)MSS;
-
-    d_cwnd = (double)(*cwnd) + cubic->cwnd_frac;
-    target = w_cubic_bytes;
-    if (target < d_cwnd)
-        target = d_cwnd;
-    if (target > 1.5 * (double)(*cwnd))
-        target = 1.5 * (double)(*cwnd);
-
-    alpha = 3.0 * (1.0 - 0.7) / (1.0 + 0.7);
-    cubic->w_est_bytes +=
-        alpha * ((double)acked * (double)MSS) / (double)(*cwnd ? *cwnd : 1U);
-
-    inc_cubic = (target - d_cwnd) * ((double)acked / (double)(*cwnd ? *cwnd : 1U));
-    inc_est = (cubic->w_est_bytes > d_cwnd) ? (cubic->w_est_bytes - d_cwnd) : 0.0;
-    inc = (inc_est > inc_cubic) ? inc_est : inc_cubic;
-
-    next_d = d_cwnd + inc;
-    if (next_d > (double)CWND_WIN_MAX)
-        next_d = (double)CWND_WIN_MAX;
-    if (next_d < (double)MSS)
-        next_d = (double)MSS;
-
-    next_cwnd = (uint32_t)next_d;
-    cubic->cwnd_frac = next_d - (double)next_cwnd;
-    *cwnd = next_cwnd;
-}
-
-static void sscp_shadow_step_ack(struct sscp_stream *ss,
-                                 uint32_t pred_ack_time,
-                                 uint32_t rtt,
-                                 uint32_t acked)
-{
-    if (ss->cc_id == SSCP_CC_CUBIC) {
-        sscp_cubic_step_ack(&ss->shadow_cwnd,
-                            ss->shadow_ssthresh,
-                            &ss->shadow_cubic,
-                            pred_ack_time,
-                            rtt,
-                            acked);
-    } else {
-        sscp_reno_step_ack(&ss->shadow_cwnd,
-                           &ss->shadow_cwnd_cnt,
-                           ss->shadow_ssthresh,
-                           acked);
-    }
-}
-
-static int sscp_shadow_topup_stream(struct sscp_stream *ss)
-{
-    uint32_t swnd = min(ss->snd_wnd, ss->shadow_cwnd);
-
-    while (ss->shadow_next) {
-        struct sscp_buf *sb = ss->shadow_next;
-        uint32_t flen = (uint32_t)(sb->len - sizeof(struct sscp_hdr));
-        struct list_node *next;
-
-        if (ss->shadow_bytes + flen > swnd)
-            return 0;
-
-        sb->budget_work = (double)flen / (double)ss->shadow_cwnd;
-        sb->budget_in_win = 1;
-        ss->slide_work += sb->budget_work;
-        ss->shadow_bytes += flen;
-
-        next = sb->list.next;
-        if (next == &ss->snd_q)
-            ss->shadow_next = NULL;
-        else
-            ss->shadow_next = container_of(next, struct sscp_buf, list);
-    }
-
-    if (ss->shadow_bytes + (uint32_t)MSS <= swnd)
-        return -1;
-
-    return 0;
-}
-
-static int sscp_budget_sync(struct sscp_stream *ss, uint32_t rtt)
-{
-    struct sscp_buf *wire_end;
-    struct list_node *cur;
-    struct list_node *pend_end;
-    uint32_t wire_bytes = 0;
-
-    wire_end = ss->pacing_next ? ss->pacing_next : ss->schedule_next;
-
-    for (cur = ss->snd_q.next; cur != &ss->snd_q; cur = cur->next) {
-        struct sscp_buf *sb = container_of(cur, struct sscp_buf, list);
-        if (sb == wire_end)
-            break;
-        if (sb->retransmitted)
-            return -1;
-        sb->budget_in_win = 0;
-        wire_bytes += (uint32_t)(sb->len - sizeof(struct sscp_hdr));
-    }
-
-    for (cur = &ss->schedule_next->list; cur != &ss->snd_q; cur = cur->next) {
-        struct sscp_buf *sb = container_of(cur, struct sscp_buf, list);
-        sb->budget_in_win = 0;
-        sb->budget_work = 0.0;
-    }
-
-    ss->slide_work = 0.0;
-    ss->shadow_bytes = wire_bytes;
-
-    pend_end = ss->schedule_next ? &ss->schedule_next->list : &ss->snd_q;
-    if (ss->pacing_next) {
-        for (cur = &ss->pacing_next->list; cur != pend_end; cur = cur->next) {
-            struct sscp_buf *sb = container_of(cur, struct sscp_buf, list);
-            uint32_t flen = (uint32_t)(sb->len - sizeof(struct sscp_hdr));
-            uint32_t w_book = sb->booked_cwnd ? sb->booked_cwnd : ss->cwnd;
-            sb->budget_work = w_book ? ((double)flen / (double)w_book) : 0.0;
-            sb->budget_in_win = 1;
-            ss->slide_work += sb->budget_work;
-            ss->shadow_bytes += flen;
-        }
-    }
-
-    ss->shadow_cwnd = ss->cwnd;
-    ss->shadow_cwnd_cnt = ss->cwnd_cnt;
-    ss->shadow_ssthresh = ss->ssthresh;
-    ss->shadow_cubic = ss->cubic;
-    ss->shadow_next = ss->schedule_next;
-
-    if (sscp_shadow_topup_stream(ss) < 0)
-        return -1;
-
-    for (cur = ss->snd_q.next; cur != &ss->snd_q; cur = cur->next) {
-        struct sscp_buf *wb = container_of(cur, struct sscp_buf, list);
-        uint32_t acked;
-        if (wb == wire_end)
-            break;
-        acked = (uint32_t)(wb->len - sizeof(struct sscp_hdr));
-        if (ss->shadow_bytes >= acked)
-            ss->shadow_bytes -= acked;
-        else
-            ss->shadow_bytes = 0;
-
-        sscp_shadow_step_ack(ss, wb->tx_time + rtt, rtt, acked);
-        if (sscp_shadow_topup_stream(ss) < 0)
-            return -1;
-    }
-
-    ss->shadow_valid = 1;
-    return 0;
-}
-
-static void sscp_budget_slide_tx(struct sscp_stream *ss,
-                                 struct sscp_buf *sb,
-                                 uint32_t now)
-{
-    uint32_t flen;
-
-    if (!ss->budget_pacing || !ss->shadow_valid || sb->retransmitted)
-        return;
-    if (ss->cc_id != SSCP_CC_AIMD && ss->cc_id != SSCP_CC_CUBIC)
-        return;
-    if (!ss->srtt || ss->fr_active || ss->recover_seq || ss->dup_acks > 0 ||
-        ss->rto_recovery > 0 || ss->timeout_count > 0) {
-        ss->shadow_valid = 0;
-        return;
-    }
-    if (!sb->budget_in_win) {
-        ss->shadow_valid = 0;
-        return;
-    }
-
-    flen = (uint32_t)(sb->len - sizeof(struct sscp_hdr));
-    ss->slide_work -= sb->budget_work;
-    if (ss->slide_work < 0.0)
-        ss->slide_work = 0.0;
-    if (ss->shadow_bytes >= flen)
-        ss->shadow_bytes -= flen;
-    else
-        ss->shadow_bytes = 0;
-    sb->budget_in_win = 0;
-
-    sscp_shadow_step_ack(ss, now + ss->srtt, ss->srtt, flen);
-    if (sscp_shadow_topup_stream(ss) < 0)
-        ss->shadow_valid = 0;
-}
-
-static void sscp_budget_update(struct sscp_stream *ss,
-                               uint32_t now,
-                               uint32_t available)
-{
-    uint32_t rtt;
-    uint32_t first_len;
-    uint64_t g_q16;
-    double g_new;
-
-    if (!ss->budget_pacing)
-        return;
-    if (ss->cc_id != SSCP_CC_AIMD && ss->cc_id != SSCP_CC_CUBIC)
-        return;
-    rtt = ss->srtt;
-    if (!rtt)
-        return;
-    if (ss->budget_next_tick && SEQ_LT(now, ss->budget_next_tick))
-        return;
-    if (!ss->schedule_next)
-        return;
-
-    first_len = (uint32_t)(ss->schedule_next->len - sizeof(struct sscp_hdr));
-    if (first_len > available)
-        return;
-
-    if (ss->fr_active || ss->recover_seq || ss->dup_acks > 0 ||
-        ss->rto_recovery > 0 || ss->timeout_count > 0) {
-        ss->shadow_valid = 0;
-        return;
-    }
-
-    if (!ss->shadow_valid) {
-        if (sscp_budget_sync(ss, rtt) < 0) {
-            ss->shadow_valid = 0;
-            return;
-        }
-    } else if (sscp_shadow_topup_stream(ss) < 0) {
-        ss->shadow_valid = 0;
-        return;
-    }
-
-    g_new = ss->slide_work;
-    if (g_new <= 0.0)
-        return;
-
-    g_q16 = (uint64_t)(g_new * (double)SSCP_GAIN_ONE_Q16 + 0.5);
-    if (g_q16 < 16384ULL)
-        g_q16 = 16384ULL;
-    if (g_q16 > (16ULL * SSCP_GAIN_ONE_Q16))
-        g_q16 = 16ULL * SSCP_GAIN_ONE_Q16;
-
-    ss->budget_gain_q16 = (uint32_t)g_q16;
-    ss->budget_next_tick = now + rtt;
 }
 
 static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
 {
     uint32_t rtt;
+    uint32_t margin;
     uint32_t gain_q16;
     uint64_t pacing_time;
     uint64_t reciprocal_q32;
@@ -1622,11 +1316,15 @@ static uint64_t sscp_pacing_time(struct sscp_stream *ss, uint32_t frag_len)
     if (!ss->srtt)
         return (uint64_t)SSCP_TICK_SCALE << SSCP_PACING_SHIFT;
 
-    rtt = ss->srtt;
-    if (ss->budget_pacing && ss->pacing_rttvar_q16 && ss->rttvar > 1 && ss->rttvar < (rtt >> 2)) {
-        rtt += (uint32_t)(((uint64_t)ss->rttvar * ss->pacing_rttvar_q16) >> 16);
+    margin = (uint32_t)(((uint64_t)ss->rtt_jitter * ss->pacing_rttvar_q16) >> 16);
+    rtt = ss->srtt + min(margin, ss->srtt >> 2);
+    if (ss->budget_pacing) {
+        gain_q16 = ss->pacing_gain_q16;
+    } else if (ss->cwnd < ss->ssthresh) {
+        gain_q16 = ss->static_ss_gain_q16 ? ss->static_ss_gain_q16 : (2U * SSCP_GAIN_ONE_Q16);
+    } else {
+        gain_q16 = ss->static_ca_gain_q16 ? ss->static_ca_gain_q16 : 78643U;
     }
-    gain_q16 = ss->cc_pacing_gain(ss);
     reciprocal_q32 = (uint64_t)SSCP_GAIN_ONE_Q16 << SSCP_PACING_SHIFT;
     reciprocal_q32 /= gain_q16;
 
@@ -1644,9 +1342,12 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
     uint32_t now;
 
     now = sscp_now_time();
-    if (SEQ_LT((uint32_t)(ss->pacing_next_time >> SSCP_PACING_SHIFT), now))
+    if (SEQ_LT((uint32_t)(ss->pacing_next_time >> SSCP_PACING_SHIFT), now)) {
         ss->pacing_next_time = (uint64_t)now << SSCP_PACING_SHIFT;
-    sscp_budget_update(ss, now, available);
+        /* RFC 9438 Sec 4.8 / Linux CA_EVENT_TX_START: reset epoch after idle. */
+        if (ss->snd_una == ss->snd_nxt)
+            ss->cubic_epoch_start = 0;
+    }
     while (ss->schedule_next) {
         struct sscp_buf *sb;
         struct list_node *next;
@@ -1664,7 +1365,9 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
             ss->pacing_next = sb;
         }
 
-        sb->booked_cwnd = ss->cwnd;
+        sb->pacing_work_q32 = ss->cc_pacing_work(ss, frag_len);
+        ss->pacing_work_sum_q32 += sb->pacing_work_q32;
+
         sb->sent_time = ss->pacing_next_time;
         ss->pacing_next_time += sscp_pacing_time(ss, frag_len);
 
@@ -1858,12 +1561,9 @@ int sscp_send(int fd, void *buf, size_t len)
 
         sb->len  = sizeof(struct sscp_hdr) + frag;
         sb->seq  = ss->snd_seq_q + (uint32_t)off;
-        sb->booked_cwnd = 0;
-        sb->tx_time = 0;
-        sb->budget_work = 0.0;
+        sb->pacing_work_q32 = 0;
         sb->dir = SSCP_DIR_SEND;
         sb->retransmitted = 0;
-        sb->budget_in_win = 0;
 
         uint8_t *pure = sb->data + sizeof(struct sscp_hdr);
         memcpy(pure, (uint8_t *)buf + off, frag);
@@ -1879,8 +1579,6 @@ int sscp_send(int fd, void *buf, size_t len)
 
         if (!ss->schedule_next)
             ss->schedule_next = sb;
-        if (!ss->shadow_next)
-            ss->shadow_next = sb;
 
     }
     ss->snd_seq_q += (uint32_t)len;
@@ -2617,12 +2315,6 @@ static void sscp_update_cwnd_fast(struct sscp_stream *ss,
     ss->cwnd = (uint32_t)w;
 }
 
-static uint32_t sscp_prob_pacing_gain(struct sscp_stream *ss)
-{
-    (void)ss;
-    return SSCP_GAIN_CA_Q16;
-}
-
 static void sscp_prob_init(struct sscp_stream *ss)
 {
     ss->cwnd = MSS;
@@ -2673,21 +2365,13 @@ static uint32_t sscp_prob_on_rtt(struct sscp_stream *ss)
     return rtt;
 }
 
-static uint32_t sscp_budget_pacing_gain(struct sscp_stream *ss)
+static uint64_t sscp_prob_pacing_work(struct sscp_stream *ss,
+                                      uint32_t frag_len)
 {
-    if (!ss->budget_pacing) {
-        if (ss->cwnd < ss->ssthresh) {
-            if (ss->static_ss_gain_q16)
-                return ss->static_ss_gain_q16;
-        } else {
-            if (ss->static_ca_gain_q16)
-                return ss->static_ca_gain_q16;
-        }
-    }
-    return ss->budget_gain_q16 ? ss->budget_gain_q16 : SSCP_GAIN_ONE_Q16;
+    return ((uint64_t)frag_len << 32) / ss->cwnd;
 }
 
-static void sscp_budget_cc_init(struct sscp_stream *ss)
+static void sscp_aimd_init(struct sscp_stream *ss)
 {
     ss->cwnd = MSS;
     ss->cwnd_cnt = 0;
@@ -2699,91 +2383,48 @@ static void sscp_budget_cc_init(struct sscp_stream *ss)
     ss->cong_q = 0;
     ss->cong_q_ema = 0;
     ss->cc_phase = SSCP_CC_PHASE_INC;
-
-    ss->budget_pacing = 1;
-    ss->shadow_valid = 0;
-    ss->budget_gain_q16 = SSCP_GAIN_ONE_Q16;
-    ss->budget_next_tick = 0;
-    ss->static_ss_gain_q16 = 0;
-    ss->static_ca_gain_q16 = 0;
-    ss->pacing_rttvar_q16 = 32768;
-    ss->shadow_bytes = 0;
-    ss->shadow_cwnd = MSS;
-    ss->shadow_cwnd_cnt = 0;
-    ss->shadow_ssthresh = CWND_WIN_MAX;
-    ss->shadow_next = NULL;
-    ss->slide_work = 0.0;
-    memset(&ss->cubic, 0, sizeof(ss->cubic));
-    memset(&ss->shadow_cubic, 0, sizeof(ss->shadow_cubic));
-}
-
-static void sscp_aimd_init(struct sscp_stream *ss)
-{
-    sscp_budget_cc_init(ss);
 }
 
 static void sscp_aimd_on_ack(struct sscp_stream *ss,
                             uint32_t acked)
 {
-    sscp_reno_step_ack(&ss->cwnd, &ss->cwnd_cnt, ss->ssthresh, acked);
-}
-
-static void sscp_cubic_init(struct sscp_stream *ss)
-{
-    sscp_budget_cc_init(ss);
-}
-
-static void sscp_cubic_on_ack(struct sscp_stream *ss,
-                              uint32_t acked)
-{
-    uint32_t rtt;
-    if (ss->fr_active)
+    if (acked == 0)
         return;
-    rtt = ss->srtt ? ss->srtt : ss->rtt_sample;
-    sscp_cubic_step_ack(&ss->cwnd,
-                        ss->ssthresh,
-                        &ss->cubic,
-                        sscp_now_time(),
-                        rtt,
-                        acked);
-}
 
-static void sscp_cubic_on_loss(struct sscp_stream *ss)
-{
-    uint32_t cwnd = ss->cwnd;
-    uint32_t minimum = 2U * MSS;
-    uint32_t reduced;
+    uint64_t next_cwnd;
 
-    if (cwnd < ss->cubic.w_last_max) {
-        ss->cubic.w_last_max = cwnd;
-        ss->cubic.w_max = (uint32_t)((double)cwnd * 0.85);
+    if (ss->cwnd < ss->ssthresh) {
+        next_cwnd =
+            (uint64_t)ss->cwnd +
+            (uint64_t)acked;
     } else {
-        ss->cubic.w_last_max = cwnd;
-        ss->cubic.w_max = cwnd;
+        uint64_t numerator =
+            (uint64_t)MSS *
+            (uint64_t)acked +
+            ss->cwnd_cnt;
+
+        uint32_t inc =
+            (uint32_t)(
+                numerator /
+                (ss->cwnd ? ss->cwnd : 1U)
+            );
+
+        ss->cwnd_cnt =
+            (uint32_t)(numerator -
+                       (uint64_t)inc * ss->cwnd);
+
+        next_cwnd =
+            (uint64_t)ss->cwnd +
+            inc;
     }
 
-    reduced = (uint32_t)((double)cwnd * 0.7);
-    ss->ssthresh = reduced > minimum ? reduced : minimum;
-    ss->cwnd = ss->ssthresh;
-    ss->cwnd_cnt = 0;
-    ss->cubic.epoch_active = 0;
-    ss->cubic.cwnd_frac = 0.0;
-}
+    if (next_cwnd > CWND_WIN_MAX)
+        next_cwnd = CWND_WIN_MAX;
 
-static void sscp_cubic_on_timeout(struct sscp_stream *ss)
-{
-    uint32_t cwnd = ss->cwnd;
-    uint32_t minimum = 2U * MSS;
-    uint32_t reduced = (uint32_t)((double)cwnd * 0.7);
+    if (next_cwnd < MSS)
+        next_cwnd = MSS;
 
-    ss->cubic.w_last_max = cwnd;
-    ss->cubic.w_max = 0;
-    ss->cubic.epoch_active = 0;
-    ss->cubic.cwnd_frac = 0.0;
-
-    ss->ssthresh = reduced > minimum ? reduced : minimum;
-    ss->cwnd = MSS;
-    ss->cwnd_cnt = 0;
+    ss->cwnd = (uint32_t)next_cwnd;
 }
 
 static void sscp_aimd_on_loss(struct sscp_stream *ss)
@@ -2814,6 +2455,245 @@ static uint32_t sscp_aimd_on_rtt(struct sscp_stream *ss)
     return ss->rtt_sample;
 }
 
+static uint64_t sscp_aimd_pacing_work(struct sscp_stream *ss,
+                                      uint32_t frag_len)
+{
+    uint32_t flight;
+    uint64_t w;
+    uint64_t next_w;
+    uint32_t dw;
+
+    flight = ss->schedule_next->seq - ss->snd_una;
+    w = ss->cwnd;
+    if (w < ss->ssthresh) {
+        uint32_t ss_room;
+
+        ss_room = ss->ssthresh - (uint32_t)w;
+        if (flight < ss_room) {
+            w += flight;
+            dw = frag_len;
+        } else {
+            w = ss->ssthresh +
+                ((uint64_t)(flight - ss_room) * MSS) / ss->ssthresh;
+            dw = (uint32_t)(((uint64_t)MSS * frag_len) / w);
+        }
+    } else {
+        w += ((uint64_t)flight * MSS) / w;
+        dw = (uint32_t)(((uint64_t)MSS * frag_len) / w);
+    }
+
+    w = min(w, (uint64_t)CWND_WIN_MAX);
+    next_w = min(w + dw, (uint64_t)CWND_WIN_MAX);
+    dw = min(ss->snd_wnd, (uint32_t)next_w) - min(ss->snd_wnd, (uint32_t)w);
+
+    return (((uint64_t)frag_len + (uint64_t)dw) << 32) / next_w;
+}
+
+/*
+ * RFC 9438 / Linux tcp_cubic 1-RTT target window growth (C = 0.4, beta = 0.7):
+ *   K = cbrt((W_max - W) / (C * MSS)) = cbrt(2.5 * (W_max - W) / MSS)
+ *   W_cubic(t + rtt_min) = W_origin + 0.4 * MSS * (t + rtt_min - K)^3
+ *   W_est slope: alpha = 3*(1-beta)/(1+beta) = 9/17 MSS/RTT below W_max,
+ *                switching to 1 MSS/RTT once W_est >= W_max (RFC 9438 Sec 4.2).
+ *   Clamped to [W + MSS/100 (Linux 100*cwnd plateau creep), 1.5 * W].
+ */
+static uint32_t sscp_cubic_dw_rtt(struct sscp_stream *ss, uint32_t w)
+{
+    uint32_t rtt;
+    uint32_t elapsed;
+    uint32_t origin;
+    uint32_t k;
+    uint32_t tcp_base;
+    uint32_t tcp_target;
+    float dt_sec;
+    int64_t target;
+
+    rtt = ss->rtt_base ? ss->rtt_base :
+          (ss->srtt ? ss->srtt : ss->rtt_sample);
+    if (ss->cubic_epoch_start) {
+        uint32_t now = sscp_now_time();
+        elapsed = SEQ_GT(now, ss->cubic_epoch_start) ?
+                  (now - ss->cubic_epoch_start) : 0;
+        origin = ss->cubic_origin;
+        k = ss->cubic_k;
+        tcp_base = ss->cubic_tcp_cwnd;
+    } else {
+        elapsed = 0;
+        if (ss->cubic_w_max <= w) {
+            origin = w;
+            k = 0;
+        } else {
+            origin = ss->cubic_w_max;
+            k = (uint32_t)((float)(1000 * SSCP_TICK_SCALE) *
+                cbrtf(2.5f * (float)(origin - w) / (float)MSS));
+        }
+        tcp_base = w;
+    }
+
+    tcp_target = tcp_base +
+                 ((tcp_base < origin) ? ((9U * MSS) / 17U) : MSS);
+
+    dt_sec = (float)((int64_t)(elapsed + rtt) - (int64_t)k) /
+             (float)(1000 * SSCP_TICK_SCALE);
+    target = (int64_t)origin +
+             (int64_t)(0.4f * (float)MSS * dt_sec * dt_sec * dt_sec);
+    if (target < (int64_t)tcp_target)
+        target = (int64_t)tcp_target;
+    if (target <= (int64_t)w)
+        return MSS / 100U;
+    if (target > (int64_t)w + (int64_t)(w >> 1))
+        return w >> 1;
+
+    return (uint32_t)(target - (int64_t)w);
+}
+
+static void sscp_cubic_init(struct sscp_stream *ss)
+{
+    sscp_aimd_init(ss);
+    ss->cubic_epoch_start = 0;
+    ss->cubic_w_max = 0;
+    ss->cubic_origin = 0;
+    ss->cubic_k = 0;
+    ss->cubic_tcp_cwnd = 0;
+    ss->cubic_ack_cnt = 0;
+}
+
+static void sscp_cubic_on_ack(struct sscp_stream *ss,
+                              uint32_t acked)
+{
+    uint32_t dw_rtt;
+    uint32_t tcp_slope;
+    uint64_t tcp_num;
+    uint32_t tcp_inc;
+    uint64_t num;
+    uint32_t inc;
+    uint64_t next_cwnd;
+
+    if (acked == 0)
+        return;
+
+    if (ss->cwnd < ss->ssthresh) {
+        next_cwnd = (uint64_t)ss->cwnd + (uint64_t)acked;
+        if (next_cwnd > CWND_WIN_MAX)
+            next_cwnd = CWND_WIN_MAX;
+        ss->cwnd = (uint32_t)next_cwnd;
+        return;
+    }
+
+    if (!ss->cubic_epoch_start) {
+        uint32_t now = sscp_now_time();
+        ss->cubic_epoch_start = now ? now : 1U;
+        ss->cwnd_cnt = 0;
+        ss->cubic_tcp_cwnd = ss->cwnd;
+        ss->cubic_ack_cnt = 0;
+        if (ss->cubic_w_max <= ss->cwnd) {
+            ss->cubic_w_max = ss->cwnd;
+            ss->cubic_origin = ss->cwnd;
+            ss->cubic_k = 0;
+        } else {
+            ss->cubic_origin = ss->cubic_w_max;
+            ss->cubic_k = (uint32_t)((float)(1000 * SSCP_TICK_SCALE) *
+                          cbrtf(2.5f * (float)(ss->cubic_w_max - ss->cwnd) /
+                                (float)MSS));
+        }
+    }
+
+    dw_rtt = sscp_cubic_dw_rtt(ss, ss->cwnd);
+
+    /* RFC 9438 Sec 4.2: two-slope Reno-friendly estimate W_est (tcp_cwnd). */
+    tcp_slope = (ss->cubic_tcp_cwnd < ss->cubic_w_max) ?
+                ((9U * MSS) / 17U) : MSS;
+    tcp_num = (uint64_t)tcp_slope * acked + ss->cubic_ack_cnt;
+    tcp_inc = (uint32_t)(tcp_num / ss->cwnd);
+    ss->cubic_ack_cnt = (uint32_t)(tcp_num - (uint64_t)tcp_inc * ss->cwnd);
+    ss->cubic_tcp_cwnd = (uint32_t)min((uint64_t)ss->cubic_tcp_cwnd + tcp_inc,
+                                       (uint64_t)CWND_WIN_MAX);
+
+    num = (uint64_t)dw_rtt * acked + ss->cwnd_cnt;
+    inc = (uint32_t)(num / ss->cwnd);
+    ss->cwnd_cnt = (uint32_t)(num - (uint64_t)inc * ss->cwnd);
+
+    next_cwnd = min((uint64_t)ss->cwnd + inc, (uint64_t)CWND_WIN_MAX);
+    if (next_cwnd < ss->cubic_tcp_cwnd) {
+        next_cwnd = ss->cubic_tcp_cwnd;
+        ss->cwnd_cnt = 0;
+    }
+    ss->cwnd = (uint32_t)next_cwnd;
+}
+
+/*
+ * RFC 9438 Sec 4.5 & 4.6: multiplicative decrease (beta = 0.7) with
+ * fast convergence (W_max = W * (1 + beta) / 2 = 0.85 * W when W < W_max).
+ */
+static void sscp_cubic_on_loss(struct sscp_stream *ss)
+{
+    uint32_t reduced;
+    uint32_t minimum;
+
+    if (ss->cwnd < ss->cubic_w_max)
+        ss->cubic_w_max = (uint32_t)(((uint64_t)ss->cwnd * 17U) / 20U);
+    else
+        ss->cubic_w_max = ss->cwnd;
+
+    reduced = (uint32_t)(((uint64_t)ss->cwnd * 7U) / 10U);
+    minimum = 2U * MSS;
+    ss->ssthresh = reduced > minimum ? reduced : minimum;
+    ss->cwnd = ss->ssthresh;
+    ss->cwnd_cnt = 0;
+    ss->cubic_epoch_start = 0;
+}
+
+static void sscp_cubic_on_timeout(struct sscp_stream *ss)
+{
+    uint32_t reduced;
+    uint32_t minimum;
+
+    reduced = (uint32_t)(((uint64_t)ss->cwnd * 7U) / 10U);
+    minimum = 2U * MSS;
+    ss->ssthresh = reduced > minimum ? reduced : minimum;
+    ss->cwnd = MSS;
+    ss->cwnd_cnt = 0;
+    ss->cubic_w_max = 0;
+    ss->cubic_epoch_start = 0;
+}
+
+static uint64_t sscp_cubic_pacing_work(struct sscp_stream *ss,
+                                       uint32_t frag_len)
+{
+    uint32_t flight;
+    uint64_t w;
+    uint64_t next_w;
+    uint32_t dw;
+    uint32_t dw_rtt;
+
+    flight = ss->schedule_next->seq - ss->snd_una;
+    w = ss->cwnd;
+    if (w < ss->ssthresh) {
+        uint32_t ss_room;
+
+        ss_room = ss->ssthresh - (uint32_t)w;
+        if (flight < ss_room) {
+            w += flight;
+            dw = frag_len;
+        } else {
+            dw_rtt = sscp_cubic_dw_rtt(ss, ss->ssthresh);
+            w = ss->ssthresh +
+                ((uint64_t)(flight - ss_room) * dw_rtt) / ss->ssthresh;
+            dw = (uint32_t)(((uint64_t)dw_rtt * frag_len) / w);
+        }
+    } else {
+        dw_rtt = sscp_cubic_dw_rtt(ss, (uint32_t)w);
+        w += ((uint64_t)flight * dw_rtt) / w;
+        dw = (uint32_t)(((uint64_t)dw_rtt * frag_len) / w);
+    }
+
+    w = min(w, (uint64_t)CWND_WIN_MAX);
+    next_w = min(w + dw, (uint64_t)CWND_WIN_MAX);
+    dw = min(ss->snd_wnd, (uint32_t)next_w) - min(ss->snd_wnd, (uint32_t)w);
+
+    return (((uint64_t)frag_len + (uint64_t)dw) << 32) / next_w;
+}
+
 static int sscp_install_cc(struct sscp_stream *ss,
                           enum sscp_cc_id cc_id)
 {
@@ -2822,30 +2702,30 @@ static int sscp_install_cc(struct sscp_stream *ss,
 
     switch (cc_id) {
     case SSCP_CC_PROB:
-        ss->cc_init       = sscp_prob_init;
-        ss->cc_on_ack     = sscp_prob_on_ack;
-        ss->cc_on_loss    = sscp_prob_on_loss;
-        ss->cc_on_timeout = sscp_prob_on_timeout;
-        ss->cc_on_rtt     = sscp_prob_on_rtt;
-        ss->cc_pacing_gain = sscp_prob_pacing_gain;
+        ss->cc_init        = sscp_prob_init;
+        ss->cc_on_ack      = sscp_prob_on_ack;
+        ss->cc_on_loss     = sscp_prob_on_loss;
+        ss->cc_on_timeout  = sscp_prob_on_timeout;
+        ss->cc_on_rtt      = sscp_prob_on_rtt;
+        ss->cc_pacing_work = sscp_prob_pacing_work;
         break;
 
     case SSCP_CC_AIMD:
-        ss->cc_init       = sscp_aimd_init;
-        ss->cc_on_ack     = sscp_aimd_on_ack;
-        ss->cc_on_loss    = sscp_aimd_on_loss;
-        ss->cc_on_timeout = sscp_aimd_on_timeout;
-        ss->cc_on_rtt     = sscp_aimd_on_rtt;
-        ss->cc_pacing_gain = sscp_budget_pacing_gain;
+        ss->cc_init        = sscp_aimd_init;
+        ss->cc_on_ack      = sscp_aimd_on_ack;
+        ss->cc_on_loss     = sscp_aimd_on_loss;
+        ss->cc_on_timeout  = sscp_aimd_on_timeout;
+        ss->cc_on_rtt      = sscp_aimd_on_rtt;
+        ss->cc_pacing_work = sscp_aimd_pacing_work;
         break;
 
     case SSCP_CC_CUBIC:
-        ss->cc_init       = sscp_cubic_init;
-        ss->cc_on_ack     = sscp_cubic_on_ack;
-        ss->cc_on_loss    = sscp_cubic_on_loss;
-        ss->cc_on_timeout = sscp_cubic_on_timeout;
-        ss->cc_on_rtt     = sscp_aimd_on_rtt;
-        ss->cc_pacing_gain = sscp_budget_pacing_gain;
+        ss->cc_init        = sscp_cubic_init;
+        ss->cc_on_ack      = sscp_cubic_on_ack;
+        ss->cc_on_loss     = sscp_cubic_on_loss;
+        ss->cc_on_timeout  = sscp_cubic_on_timeout;
+        ss->cc_on_rtt      = sscp_aimd_on_rtt;
+        ss->cc_pacing_work = sscp_cubic_pacing_work;
         break;
 
     default:
@@ -2853,6 +2733,13 @@ static int sscp_install_cc(struct sscp_stream *ss,
     }
 
     ss->cc_id = (uint8_t)cc_id;
+    ss->pacing_work_sum_q32 = 0;
+    ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
+    ss->pacing_next_tick = sscp_now_time();
+    ss->budget_pacing = 1;
+    ss->static_ss_gain_q16 = 0;
+    ss->static_ca_gain_q16 = 0;
+    ss->pacing_rttvar_q16 = 32768U;
 
     if (ss->cc_init)
         ss->cc_init(ss);

@@ -12,7 +12,7 @@ parser.add_argument("executable", type=Path)
 parser.add_argument("--bytes", type=int, default=1073741824)
 parser.add_argument("--out", type=Path, default=Path("udp-results"))
 parser.add_argument("--timeout", type=int, default=600)
-parser.add_argument("--mode", choices=["aimd", "prob", "pacing", "prob-prob", "prob-aimd"], default="aimd")
+parser.add_argument("--mode", choices=["aimd", "prob", "cubic", "pacing", "prob-prob", "prob-aimd"], default="aimd")
 parser.add_argument("--seconds", type=int, default=3)
 parser.add_argument("--backend", choices=["udp", "virtual"], default="udp")
 parser.add_argument("--file", type=Path)
@@ -27,7 +27,7 @@ parser.add_argument("--loss-ppm", type=int, default=0)
 parser.add_argument("--seed", type=int, default=1)
 args = parser.parse_args()
 if args.bytes < 1 or args.seconds < 1: parser.error("Bytes and seconds must be positive")
-if args.backend == "virtual" and args.mode not in ("aimd", "prob", "pacing"): parser.error("Virtual transfer requires a single flow")
+if args.backend == "virtual" and args.mode not in ("aimd", "prob", "cubic", "pacing"): parser.error("Virtual transfer requires a single flow")
 if args.send_backlog_bytes is not None and args.backend != "virtual": parser.error("Backlog option requires virtual transfer")
 args.out = args.out.resolve()
 if args.file: args.file = args.file.resolve()
@@ -57,6 +57,7 @@ if args.backend == "virtual":
     command = [exe, "--bytes", str(args.bytes), "--mbps", str(args.mbps),
                "--delay-ms", str(args.delay_ms), "--loss-ppm", str(args.loss_ppm), "--seed", str(args.seed)]
     if args.mode == "prob": command += ["--cc", "0"]
+    elif args.mode == "cubic": command += ["--cc", "2"]
     if args.send_backlog_bytes is not None:
         command += ["--send-backlog-bytes", str(args.send_backlog_bytes)]
     summary = args.out / "summary.json"

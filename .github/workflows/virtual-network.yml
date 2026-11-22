@@ -11,8 +11,14 @@ on:
         type: choice
         default: scenarios
         options: [quick, broad, large, stress, scenarios, scenarios-1g, shallow-stress]
+      cc:
+        description: Congestion control algorithm(s)
+        type: choice
+        default: both
+        options: [both, aimd, cubic, prob, all]
 permissions:
   contents: read
+  actions: read
 jobs:
   transfers:
     runs-on: ubuntu-latest
@@ -29,10 +35,14 @@ jobs:
           cmake -S test -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
           cmake --build build-asan -j2
           ctest --test-dir build-asan -L virtual --output-on-failure
-      - name: Virtual network 1 GiB transfer
-        run: python3 test/run.py build/sscp_virtual --backend virtual --bytes 1073741824 --mbps 1000 --out results/transfers/virtual-1g
-      - name: Linux UDP file transfer 1 GiB
-        run: python3 test/run.py build/sscp_udp --file-test --bytes 1073741824 --out results/transfers/linux-udp-1g
+      - name: Virtual network 1 GiB transfer (AIMD & CUBIC)
+        run: |
+          python3 test/run.py build/sscp_virtual --backend virtual --mode aimd --bytes 1073741824 --mbps 1000 --out results/transfers/virtual-1g-aimd
+          python3 test/run.py build/sscp_virtual --backend virtual --mode cubic --bytes 1073741824 --mbps 1000 --out results/transfers/virtual-1g-cubic
+      - name: Linux UDP file transfer 1 GiB (AIMD & CUBIC)
+        run: |
+          python3 test/run.py build/sscp_udp --file-test --mode aimd --bytes 1073741824 --out results/transfers/linux-udp-1g-aimd
+          python3 test/run.py build/sscp_udp --file-test --mode cubic --bytes 1073741824 --out results/transfers/linux-udp-1g-cubic
       - name: Publish transfer results
         if: always()
         run: |
@@ -67,7 +77,8 @@ jobs:
       - name: Sweep configured network environments
         env:
           PROFILE: ${{ inputs.profile || 'scenarios' }}
-        run: python3 test/virtual/sweep.py build/sscp_virtual --config test/virtual/network_sweep.json --profile "$PROFILE" --shard-index ${{ matrix.shard }} --shard-count 8 --jobs 2 --out results/shard-${{ matrix.shard }}
+          CC: ${{ inputs.cc || 'both' }}
+        run: python3 test/virtual/sweep.py build/sscp_virtual --config test/virtual/network_sweep.json --profile "$PROFILE" --cc "$CC" --shard-index ${{ matrix.shard }} --shard-count 8 --jobs 2 --out results/shard-${{ matrix.shard }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -89,7 +100,22 @@ jobs:
           pattern: network-shard-*
           merge-multiple: true
           path: results
-      - run: python3 test/virtual/sweep.py --merge results
+      - name: Download previous main sweep baseline for regression diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUR_RUN_ID: ${{ github.run_id }}
+        run: |
+          mkdir -p prev-baseline
+          PREV_INFO=$(gh run list --workflow virtual-network.yml --branch main --status completed --limit 15 --json databaseId,headSha,conclusion --jq ".[] | select(.databaseId != $CUR_RUN_ID and (.conclusion == \"success\" or .conclusion == \"failure\")) | \"\(.databaseId) \(.headSha[0:7])\"" | head -n 1 || true)
+          if [ -n "$PREV_INFO" ]; then
+            PREV_ID=$(echo "$PREV_INFO" | awk '{print $1}')
+            PREV_SHA=$(echo "$PREV_INFO" | awk '{print $2}')
+            if gh run download "$PREV_ID" -n network-report -D prev-baseline 2>/dev/null && [ -f prev-baseline/sweep.csv ]; then
+              echo "BASELINE_ARGS=--baseline prev-baseline/sweep.csv --baseline-label commit-$PREV_SHA(run-$PREV_ID)" >> "$GITHUB_ENV"
+            fi
+          fi
+      - name: Merge shards and compute regression report
+        run: python3 test/virtual/sweep.py --merge results $BASELINE_ARGS
       - uses: actions/upload-artifact@v4
         id: figures
         if: always()

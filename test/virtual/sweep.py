@@ -14,8 +14,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from report import write_report
 
-if len(sys.argv) == 3 and sys.argv[1] == "--merge":
-    root = Path(sys.argv[2])
+CC_NAMES = {0: "PROB", 1: "AIMD", 2: "CUBIC"}
+CC_CHOICES = {"0": [0], "1": [1], "2": [2], "prob": [0], "aimd": [1], "cubic": [2], "both": [1, 2], "all": [0, 1, 2]}
+
+if len(sys.argv) >= 3 and sys.argv[1] == "--merge":
+    merge_parser = argparse.ArgumentParser()
+    merge_parser.add_argument("--merge", type=Path, required=True)
+    merge_parser.add_argument("--baseline", type=Path)
+    merge_parser.add_argument("--baseline-label", default="previous run")
+    margs = merge_parser.parse_args()
+    root = margs.merge
     rows, expected, total_planned = [], 0, 0
     for directory in sorted(root.glob("shard-*")):
         plan = directory / "plan.json"
@@ -25,12 +33,16 @@ if len(sys.argv) == 3 and sys.argv[1] == "--merge":
             total_planned = max(total_planned, metadata.get("total_cases", 0))
         path = directory / "sweep.csv"
         if path.exists():
-            with path.open() as f:
+            with path.open(encoding="utf-8") as f:
                 rows.extend(csv.DictReader(f))
     if not rows:
         raise SystemExit("No completed shard reports found")
+    baseline_rows = None
+    if margs.baseline and margs.baseline.exists():
+        with margs.baseline.open(encoding="utf-8") as f:
+            baseline_rows = list(csv.DictReader(f))
     expected = total_planned or expected
-    passed = write_report(root, rows, expected)
+    passed = write_report(root, rows, expected, baseline_rows=baseline_rows, baseline_label=margs.baseline_label)
     raise SystemExit(0 if passed == expected else 1)
 
 parser = argparse.ArgumentParser()
@@ -39,6 +51,9 @@ parser.add_argument("--out", type=Path, default=Path("results/sweep"))
 parser.add_argument("--jobs", type=int, default=2)
 parser.add_argument("--config", type=Path, default=Path(__file__).with_name("network_sweep.json"))
 parser.add_argument("--profile", default="broad")
+parser.add_argument("--cc", default="both", choices=list(CC_CHOICES))
+parser.add_argument("--baseline", type=Path)
+parser.add_argument("--baseline-label", default="baseline")
 parser.add_argument("--shard-index", type=int, default=0)
 parser.add_argument("--shard-count", type=int, default=1)
 parser.add_argument("--list", action="store_true")
@@ -48,12 +63,15 @@ out = args.out.resolve()
 out.mkdir(parents=True, exist_ok=True)
 config = json.loads(args.config.read_text())
 settings = config["defaults"]
+cc_list = CC_CHOICES[str(args.cc).lower()]
 cases = []
 fields = ("mbps", "delay_ms", "loss_ppm", "bytes", "seed", "queue_packets")
-for grid in config["profiles"][args.profile]:
-    cases.extend(dict(zip(fields, values), scenario=grid.get("scenario", "network"),
-                      require_zero_rto=grid.get("require_zero_rto", False))
-                 for values in itertools.product(*(grid.get(k, [0]) for k in fields)))
+for cc_id in cc_list:
+    for grid in config["profiles"][args.profile]:
+        cases.extend(dict(zip(fields, values), cc=cc_id, cc_name=CC_NAMES[cc_id],
+                          scenario=grid.get("scenario", "network"),
+                          require_zero_rto=grid.get("require_zero_rto", False))
+                     for values in itertools.product(*(grid.get(k, [0]) for k in fields)))
 cases = list({tuple(c.items()): c for c in cases}.values())
 if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
     parser.error("Invalid shard index/count")
@@ -70,14 +88,16 @@ metadata = dict(settings=settings, cases=cases, total_cases=total_cases, profile
 (out / "plan.json").write_text(json.dumps(metadata, indent=2))
 
 def run(case):
-    rate, delay, loss, size, seed = (case[k] for k in ("mbps", "delay_ms", "loss_ppm", "bytes", "seed"))
-    directory = out / (case.get("scenario", "network") + "_" + f"bytes{size}_rate{rate}_delay{delay}_loss{loss}_queue{case['queue_packets']}_seed{seed}")
+    rate, delay, loss, size, seed, cc_id = (case[k] for k in ("mbps", "delay_ms", "loss_ppm", "bytes", "seed", "cc"))
+    cc_tag = case.get("cc_name", CC_NAMES.get(cc_id, "CC")).lower()
+    directory = out / (case.get("scenario", "network") + f"_{cc_tag}_" + f"bytes{size}_rate{rate}_delay{delay}_loss{loss}_queue{case['queue_packets']}_seed{seed}")
     directory.mkdir(exist_ok=True)
     row = dict(case)
     command = [str(exe), "--bytes", str(size), "--mbps", str(rate),
                "--delay-ms", str(delay), "--loss-ppm", str(loss), "--seed", str(seed),
                "--timeout-ms", str(settings["simulated_timeout_ms"]),
-               "--queue-packets", str(case["queue_packets"])]
+               "--queue-packets", str(case["queue_packets"]),
+               "--cc", str(cc_id)]
     row["repro_command"] = ("& " + subprocess.list2cmdline(command)) if os.name == "nt" else shlex.join(command)
     (directory / "config.json").write_text(json.dumps(row, indent=2))
     summary = directory / "summary.json"
@@ -132,6 +152,10 @@ def run(case):
 
 with ThreadPoolExecutor(max_workers=args.jobs) as pool:
     rows = list(pool.map(run, cases))
-passed = write_report(out, rows)
+baseline_rows = None
+if args.baseline and args.baseline.exists():
+    with args.baseline.open(encoding="utf-8") as f:
+        baseline_rows = list(csv.DictReader(f))
+passed = write_report(out, rows, baseline_rows=baseline_rows, baseline_label=args.baseline_label)
 print(f"Completed: {passed}/{len(rows)} passed. Report: {out / 'report.md'}")
 raise SystemExit(0 if passed == len(rows) else 1)

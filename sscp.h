@@ -58,8 +58,6 @@ struct sscp_timer {
 #define PERSIST_INTERVAL (200U * (SSCP_TICK_SCALE))
 #define SSCP_PACING_SHIFT 32U
 #define SSCP_GAIN_ONE_Q16 (1U << 16)
-#define SSCP_GAIN_SS_Q16 90852U     /* round(2 * ln(2) * 2^16). */
-#define SSCP_GAIN_CA_Q16 107998U    /* round((3 * ln(3) / 2) * 2^16). */
 #define MAX_IDLE_FAIL  3
 #define IDLE_TIMEOUT (100000U * (SSCP_TICK_SCALE))
 #define MSS (MTU - sizeof(struct sscp_hdr))
@@ -82,12 +80,9 @@ struct sscp_buf {
     size_t len;
     uint32_t seq; // save it from hdr.
     uint64_t sent_time; // planned pacing send time, Q32.32 ticks
-    uint32_t booked_cwnd;
-    uint32_t tx_time;
-    double   budget_work;
+    uint64_t pacing_work_q32; // predicted next-RTT pacing work, Q32.32
     uint8_t dir:1;
     uint8_t retransmitted:1;
-    uint8_t budget_in_win:1;
     uint8_t *data;
     uint32_t payload_off;
 };
@@ -135,20 +130,9 @@ enum sscp_cc_phase {
 };
 
 enum sscp_cc_id {
-    SSCP_CC_PROB = 0,
-    SSCP_CC_AIMD = 1,
+    SSCP_CC_PROB  = 0,
+    SSCP_CC_AIMD  = 1,
     SSCP_CC_CUBIC = 2
-};
-
-struct sscp_cubic_state {
-    uint8_t  epoch_active;
-    uint32_t epoch_start;
-    uint32_t w_last_max;
-    uint32_t w_max;
-    uint32_t origin_point;
-    double   k_sec;
-    double   w_est_bytes;
-    double   cwnd_frac;
 };
 
 struct sscp_stream {
@@ -182,7 +166,8 @@ struct sscp_stream {
     uint32_t rtt_sample;
     uint32_t srtt;                      // smoothed RTT
     uint32_t rtt_base;
-    uint32_t rttvar;                    // RTT variation
+    uint32_t rttvar;                    // RTT variation (RFC 6298, for RTO)
+    uint32_t rtt_jitter;                // smoothed |rtt_sample - srtt| for pacing
     uint32_t rto;                       // retransmission timeout
     uint32_t rto_recovery;
 
@@ -234,31 +219,30 @@ struct sscp_stream {
     uint32_t ssthresh;
     uint32_t recover_seq;
 
+    uint32_t cubic_epoch_start; // CA epoch start timestamp (0 = inactive)
+    uint32_t cubic_w_max;       // W_max before last loss reduction (bytes)
+    uint32_t cubic_origin;      // W_origin at epoch start (bytes)
+    uint32_t cubic_k;           // K in SSCP ticks
+    uint32_t cubic_tcp_cwnd;    // Reno-friendly W_est (bytes)
+    uint32_t cubic_ack_cnt;     // remainder for cubic_tcp_cwnd (< cwnd)
+
     int32_t prob_gamma_q16;
     int32_t prob_beta_q16;
 
-    uint8_t  budget_pacing;
-    uint8_t  shadow_valid;
-    uint32_t budget_gain_q16;
-    uint32_t budget_next_tick;
-    uint32_t static_ss_gain_q16;
-    uint32_t static_ca_gain_q16;
-    uint32_t pacing_rttvar_q16;
-    uint32_t shadow_bytes;
-    uint32_t shadow_cwnd;
-    uint32_t shadow_cwnd_cnt;
-    uint32_t shadow_ssthresh;
-    struct sscp_buf *shadow_next;
-    double   slide_work;
-    struct sscp_cubic_state cubic;
-    struct sscp_cubic_state shadow_cubic;
+    uint64_t pacing_work_sum_q32; // sum of in-flight next-RTT pacing work, Q32.32
+    uint32_t pacing_gain_q16; // fixed pacing gain for current RTT round, Q16
+    uint32_t pacing_next_tick; // next timestamp to refresh pacing_gain_q16
+    uint8_t  budget_pacing; // 1 = BudgetO1 (default), 0 = static ss/ca gain control
+    uint32_t static_ss_gain_q16; // static SS gain in Q16 when budget_pacing == 0
+    uint32_t static_ca_gain_q16; // static CA gain in Q16 when budget_pacing == 0
+    uint32_t pacing_rttvar_q16; // jitter headroom factor k in Q16 (default 32768 = 0.5)
 
     void (*cc_init)(struct sscp_stream *ss);
     void (*cc_on_ack)(struct sscp_stream *ss, uint32_t acked);
     uint32_t (*cc_on_rtt)(struct sscp_stream *ss);
-    uint32_t (*cc_pacing_gain)(struct sscp_stream *ss);
     void (*cc_on_loss)(struct sscp_stream *ss);
     void (*cc_on_timeout)(struct sscp_stream *ss);
+    uint64_t (*cc_pacing_work)(struct sscp_stream *ss, uint32_t frag_len);
 };
 
 /*
