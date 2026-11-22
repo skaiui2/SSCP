@@ -31,6 +31,7 @@ int main(int argc, char **argv)
         seconds = argc > 3 ? (uint32_t)amount : 300;
     } else {
         if (!strcmp(mode, "prob")) cc = SSCP_CC_PROB;
+        else if (!strcmp(mode, "cubic")) cc = SSCP_CC_CUBIC;
         else if (strcmp(mode, "aimd") && strcmp(mode, "pacing")) goto usage;
         if (argc > 3) bytes = amount;
         if (!bytes) goto usage;
@@ -39,6 +40,6 @@ int main(int argc, char **argv)
     return transfer_udp_run(sender, argc > 2 ? argv[2] : "127.0.0.1", bytes,
                             cc, flows, seconds, !strcmp(mode, "prob-aimd"), file_path);
 usage:
-    fprintf(stderr, "usage: %s A|B [peer-ip] [bytes|seconds] [aimd|prob|pacing|prob-prob|prob-aimd] [--file path]\n", argv[0]);
+    fprintf(stderr, "usage: %s A|B [peer-ip] [bytes|seconds] [aimd|prob|cubic|pacing|prob-prob|prob-aimd] [--file path]\n", argv[0]);
     return 2;
 }

@@ -119,7 +119,8 @@ int main(int argc, char **argv)
         }
         else return 2;
     }
-    if (!total || loss > 1000000 || !timeout || (cc != SSCP_CC_AIMD && cc != SSCP_CC_PROB)) return 2;
+    if (!total || loss > 1000000 || !timeout ||
+        (cc != SSCP_CC_AIMD && cc != SSCP_CC_PROB && cc != SSCP_CC_CUBIC)) return 2;
     summary = fopen("summary.json", "w");
     if (!summary) return 2;
     vnet_init(delay, rate, loss, seed);

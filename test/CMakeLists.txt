@@ -42,7 +42,7 @@ if(SSCP_TEST_TRANSFER)
       ${CMAKE_CURRENT_SOURCE_DIR}/run.py $<TARGET_FILE:sscp_udp>
       --no-plot --bytes 8388625 --out ${CMAKE_CURRENT_BINARY_DIR}/results/udp)
     set_tests_properties(udp_transfer PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS real)
-    foreach(mode prob pacing prob-prob prob-aimd)
+    foreach(mode prob pacing cubic prob-prob prob-aimd)
       add_test(NAME udp_${mode} COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/run.py $<TARGET_FILE:sscp_udp>
         --no-plot --bytes 8388625 --mode ${mode} --seconds 3
@@ -64,6 +64,8 @@ if(SSCP_TEST_TRANSFER)
   file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/results/smoke
     ${CMAKE_CURRENT_BINARY_DIR}/results/loss
     ${CMAKE_CURRENT_BINARY_DIR}/results/prob
+    ${CMAKE_CURRENT_BINARY_DIR}/results/cubic
+    ${CMAKE_CURRENT_BINARY_DIR}/results/cubic-loss
     ${CMAKE_CURRENT_BINARY_DIR}/results/fixed-feedback)
   add_test(NAME transfer_smoke COMMAND sscp_virtual --bytes 8388625)
   set_tests_properties(transfer_smoke PROPERTIES
@@ -77,4 +79,10 @@ if(SSCP_TEST_TRANSFER)
   add_test(NAME transfer_prob COMMAND sscp_virtual --bytes 8388625 --cc 0)
   set_tests_properties(transfer_prob PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/results/prob LABELS virtual TIMEOUT 120)
+  add_test(NAME transfer_cubic COMMAND sscp_virtual --bytes 8388625 --cc 2)
+  set_tests_properties(transfer_cubic PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/results/cubic LABELS virtual)
+  add_test(NAME transfer_cubic_loss COMMAND sscp_virtual --bytes 8388625 --cc 2 --loss-ppm 1000 --seed 7)
+  set_tests_properties(transfer_cubic_loss PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/results/cubic-loss LABELS virtual)
 endif()

@@ -130,8 +130,9 @@ enum sscp_cc_phase {
 };
 
 enum sscp_cc_id {
-    SSCP_CC_PROB = 0,
-    SSCP_CC_AIMD = 1
+    SSCP_CC_PROB  = 0,
+    SSCP_CC_AIMD  = 1,
+    SSCP_CC_CUBIC = 2
 };
 
 struct sscp_stream {
@@ -217,6 +218,13 @@ struct sscp_stream {
 
     uint32_t ssthresh;
     uint32_t recover_seq;
+
+    uint32_t cubic_epoch_start; // CA epoch start timestamp (0 = inactive)
+    uint32_t cubic_w_max;       // W_max before last loss reduction (bytes)
+    uint32_t cubic_origin;      // W_origin at epoch start (bytes)
+    uint32_t cubic_k;           // K in SSCP ticks
+    uint32_t cubic_tcp_cwnd;    // Reno-friendly W_est (bytes)
+    uint32_t cubic_ack_cnt;     // remainder for cubic_tcp_cwnd (< cwnd)
 
     int32_t prob_gamma_q16;
     int32_t prob_beta_q16;

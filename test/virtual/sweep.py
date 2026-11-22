@@ -39,6 +39,7 @@ parser.add_argument("--out", type=Path, default=Path("results/sweep"))
 parser.add_argument("--jobs", type=int, default=2)
 parser.add_argument("--config", type=Path, default=Path(__file__).with_name("network_sweep.json"))
 parser.add_argument("--profile", default="broad")
+parser.add_argument("--cc", type=int, choices=[0, 1, 2], default=1)
 parser.add_argument("--shard-index", type=int, default=0)
 parser.add_argument("--shard-count", type=int, default=1)
 parser.add_argument("--list", action="store_true")
@@ -77,7 +78,8 @@ def run(case):
     command = [str(exe), "--bytes", str(size), "--mbps", str(rate),
                "--delay-ms", str(delay), "--loss-ppm", str(loss), "--seed", str(seed),
                "--timeout-ms", str(settings["simulated_timeout_ms"]),
-               "--queue-packets", str(case["queue_packets"])]
+               "--queue-packets", str(case["queue_packets"]),
+               "--cc", str(args.cc)]
     row["repro_command"] = ("& " + subprocess.list2cmdline(command)) if os.name == "nt" else shlex.join(command)
     (directory / "config.json").write_text(json.dumps(row, indent=2))
     summary = directory / "summary.json"

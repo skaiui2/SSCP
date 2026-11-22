@@ -1322,8 +1322,12 @@ static void sscp_output_to_pacing(struct sscp_stream *ss, uint32_t available)
     uint32_t now;
 
     now = sscp_now_time();
-    if (SEQ_LT((uint32_t)(ss->pacing_next_time >> SSCP_PACING_SHIFT), now))
+    if (SEQ_LT((uint32_t)(ss->pacing_next_time >> SSCP_PACING_SHIFT), now)) {
         ss->pacing_next_time = (uint64_t)now << SSCP_PACING_SHIFT;
+        /* RFC 9438 Sec 4.8 / Linux CA_EVENT_TX_START: reset epoch after idle. */
+        if (ss->snd_una == ss->snd_nxt)
+            ss->cubic_epoch_start = 0;
+    }
     while (ss->schedule_next) {
         struct sscp_buf *sb;
         struct list_node *next;
@@ -2465,6 +2469,211 @@ static uint64_t sscp_aimd_pacing_work(struct sscp_stream *ss,
     return (((uint64_t)frag_len + (uint64_t)dw) << 32) / next_w;
 }
 
+/*
+ * RFC 9438 / Linux tcp_cubic 1-RTT target window growth (C = 0.4, beta = 0.7):
+ *   K = cbrt((W_max - W) / (C * MSS)) = cbrt(2.5 * (W_max - W) / MSS)
+ *   W_cubic(t + rtt_min) = W_origin + 0.4 * MSS * (t + rtt_min - K)^3
+ *   W_est slope: alpha = 3*(1-beta)/(1+beta) = 9/17 MSS/RTT below W_max,
+ *                switching to 1 MSS/RTT once W_est >= W_max (RFC 9438 Sec 4.2).
+ *   Clamped to [W + MSS/100 (Linux 100*cwnd plateau creep), 1.5 * W].
+ */
+static uint32_t sscp_cubic_dw_rtt(struct sscp_stream *ss, uint32_t w)
+{
+    uint32_t rtt;
+    uint32_t elapsed;
+    uint32_t origin;
+    uint32_t k;
+    uint32_t tcp_base;
+    uint32_t tcp_target;
+    float dt_sec;
+    int64_t target;
+
+    rtt = ss->rtt_base ? ss->rtt_base :
+          (ss->srtt ? ss->srtt : ss->rtt_sample);
+    if (ss->cubic_epoch_start) {
+        uint32_t now = sscp_now_time();
+        elapsed = SEQ_GT(now, ss->cubic_epoch_start) ?
+                  (now - ss->cubic_epoch_start) : 0;
+        origin = ss->cubic_origin;
+        k = ss->cubic_k;
+        tcp_base = ss->cubic_tcp_cwnd;
+    } else {
+        elapsed = 0;
+        if (ss->cubic_w_max <= w) {
+            origin = w;
+            k = 0;
+        } else {
+            origin = ss->cubic_w_max;
+            k = (uint32_t)((float)(1000 * SSCP_TICK_SCALE) *
+                cbrtf(2.5f * (float)(origin - w) / (float)MSS));
+        }
+        tcp_base = w;
+    }
+
+    tcp_target = tcp_base +
+                 ((tcp_base < origin) ? ((9U * MSS) / 17U) : MSS);
+
+    dt_sec = (float)((int64_t)(elapsed + rtt) - (int64_t)k) /
+             (float)(1000 * SSCP_TICK_SCALE);
+    target = (int64_t)origin +
+             (int64_t)(0.4f * (float)MSS * dt_sec * dt_sec * dt_sec);
+    if (target < (int64_t)tcp_target)
+        target = (int64_t)tcp_target;
+    if (target <= (int64_t)w)
+        return MSS / 100U;
+    if (target > (int64_t)w + (int64_t)(w >> 1))
+        return w >> 1;
+
+    return (uint32_t)(target - (int64_t)w);
+}
+
+static void sscp_cubic_init(struct sscp_stream *ss)
+{
+    sscp_aimd_init(ss);
+    ss->cubic_epoch_start = 0;
+    ss->cubic_w_max = 0;
+    ss->cubic_origin = 0;
+    ss->cubic_k = 0;
+    ss->cubic_tcp_cwnd = 0;
+    ss->cubic_ack_cnt = 0;
+}
+
+static void sscp_cubic_on_ack(struct sscp_stream *ss,
+                              uint32_t acked)
+{
+    uint32_t dw_rtt;
+    uint32_t tcp_slope;
+    uint64_t tcp_num;
+    uint32_t tcp_inc;
+    uint64_t num;
+    uint32_t inc;
+    uint64_t next_cwnd;
+
+    if (acked == 0 || ss->fr_active)
+        return;
+
+    if (ss->cwnd < ss->ssthresh) {
+        next_cwnd = (uint64_t)ss->cwnd + (uint64_t)acked;
+        if (next_cwnd > CWND_WIN_MAX)
+            next_cwnd = CWND_WIN_MAX;
+        ss->cwnd = (uint32_t)next_cwnd;
+        return;
+    }
+
+    if (!ss->cubic_epoch_start) {
+        uint32_t now = sscp_now_time();
+        ss->cubic_epoch_start = now ? now : 1U;
+        ss->cwnd_cnt = 0;
+        ss->cubic_tcp_cwnd = ss->cwnd;
+        ss->cubic_ack_cnt = 0;
+        if (ss->cubic_w_max <= ss->cwnd) {
+            ss->cubic_w_max = ss->cwnd;
+            ss->cubic_origin = ss->cwnd;
+            ss->cubic_k = 0;
+        } else {
+            ss->cubic_origin = ss->cubic_w_max;
+            ss->cubic_k = (uint32_t)((float)(1000 * SSCP_TICK_SCALE) *
+                          cbrtf(2.5f * (float)(ss->cubic_w_max - ss->cwnd) /
+                                (float)MSS));
+        }
+    }
+
+    dw_rtt = sscp_cubic_dw_rtt(ss, ss->cwnd);
+
+    /* RFC 9438 Sec 4.2: two-slope Reno-friendly estimate W_est (tcp_cwnd). */
+    tcp_slope = (ss->cubic_tcp_cwnd < ss->cubic_w_max) ?
+                ((9U * MSS) / 17U) : MSS;
+    tcp_num = (uint64_t)tcp_slope * acked + ss->cubic_ack_cnt;
+    tcp_inc = (uint32_t)(tcp_num / ss->cwnd);
+    ss->cubic_ack_cnt = (uint32_t)(tcp_num - (uint64_t)tcp_inc * ss->cwnd);
+    ss->cubic_tcp_cwnd = (uint32_t)min((uint64_t)ss->cubic_tcp_cwnd + tcp_inc,
+                                       (uint64_t)CWND_WIN_MAX);
+
+    num = (uint64_t)dw_rtt * acked + ss->cwnd_cnt;
+    inc = (uint32_t)(num / ss->cwnd);
+    ss->cwnd_cnt = (uint32_t)(num - (uint64_t)inc * ss->cwnd);
+
+    next_cwnd = min((uint64_t)ss->cwnd + inc, (uint64_t)CWND_WIN_MAX);
+    if (next_cwnd < ss->cubic_tcp_cwnd) {
+        next_cwnd = ss->cubic_tcp_cwnd;
+        ss->cwnd_cnt = 0;
+    }
+    ss->cwnd = (uint32_t)next_cwnd;
+}
+
+/*
+ * RFC 9438 Sec 4.5 & 4.6: multiplicative decrease (beta = 0.7) with
+ * fast convergence (W_max = W * (1 + beta) / 2 = 0.85 * W when W < W_max).
+ */
+static void sscp_cubic_on_loss(struct sscp_stream *ss)
+{
+    uint32_t reduced;
+    uint32_t minimum;
+
+    if (ss->cwnd < ss->cubic_w_max)
+        ss->cubic_w_max = (uint32_t)(((uint64_t)ss->cwnd * 17U) / 20U);
+    else
+        ss->cubic_w_max = ss->cwnd;
+
+    reduced = (uint32_t)(((uint64_t)ss->cwnd * 7U) / 10U);
+    minimum = 2U * MSS;
+    ss->ssthresh = reduced > minimum ? reduced : minimum;
+    ss->cwnd = ss->ssthresh;
+    ss->cwnd_cnt = 0;
+    ss->cubic_epoch_start = 0;
+}
+
+static void sscp_cubic_on_timeout(struct sscp_stream *ss)
+{
+    uint32_t reduced;
+    uint32_t minimum;
+
+    reduced = (uint32_t)(((uint64_t)ss->cwnd * 7U) / 10U);
+    minimum = 2U * MSS;
+    ss->ssthresh = reduced > minimum ? reduced : minimum;
+    ss->cwnd = MSS;
+    ss->cwnd_cnt = 0;
+    ss->cubic_w_max = 0;
+    ss->cubic_epoch_start = 0;
+}
+
+static uint64_t sscp_cubic_pacing_work(struct sscp_stream *ss,
+                                       uint32_t frag_len)
+{
+    uint32_t flight;
+    uint64_t w;
+    uint64_t next_w;
+    uint32_t dw;
+    uint32_t dw_rtt;
+
+    flight = ss->schedule_next->seq - ss->snd_una;
+    w = ss->cwnd;
+    if (w < ss->ssthresh) {
+        uint32_t ss_room;
+
+        ss_room = ss->ssthresh - (uint32_t)w;
+        if (flight < ss_room) {
+            w += flight;
+            dw = frag_len;
+        } else {
+            dw_rtt = sscp_cubic_dw_rtt(ss, ss->ssthresh);
+            w = ss->ssthresh +
+                ((uint64_t)(flight - ss_room) * dw_rtt) / ss->ssthresh;
+            dw = (uint32_t)(((uint64_t)dw_rtt * frag_len) / w);
+        }
+    } else {
+        dw_rtt = sscp_cubic_dw_rtt(ss, (uint32_t)w);
+        w += ((uint64_t)flight * dw_rtt) / w;
+        dw = (uint32_t)(((uint64_t)dw_rtt * frag_len) / w);
+    }
+
+    w = min(w, (uint64_t)CWND_WIN_MAX);
+    next_w = min(w + dw, (uint64_t)CWND_WIN_MAX);
+    dw = min(ss->snd_wnd, (uint32_t)next_w) - min(ss->snd_wnd, (uint32_t)w);
+
+    return (((uint64_t)frag_len + (uint64_t)dw) << 32) / next_w;
+}
+
 static int sscp_install_cc(struct sscp_stream *ss,
                           enum sscp_cc_id cc_id)
 {
@@ -2488,6 +2697,15 @@ static int sscp_install_cc(struct sscp_stream *ss,
         ss->cc_on_timeout  = sscp_aimd_on_timeout;
         ss->cc_on_rtt      = sscp_aimd_on_rtt;
         ss->cc_pacing_work = sscp_aimd_pacing_work;
+        break;
+
+    case SSCP_CC_CUBIC:
+        ss->cc_init        = sscp_cubic_init;
+        ss->cc_on_ack      = sscp_cubic_on_ack;
+        ss->cc_on_loss     = sscp_cubic_on_loss;
+        ss->cc_on_timeout  = sscp_cubic_on_timeout;
+        ss->cc_on_rtt      = sscp_aimd_on_rtt;
+        ss->cc_pacing_work = sscp_cubic_pacing_work;
         break;
 
     default:
