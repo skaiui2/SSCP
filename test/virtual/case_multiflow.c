@@ -109,7 +109,7 @@ static int parse_flow_spec(const char *spec, struct flow_cfg *fcfg, int *out_idx
     fcfg[*out_idx].budget_pacing = (int)(vals[2] != 0);
     fcfg[*out_idx].ss_g_q16 = (uint32_t)vals[3];
     fcfg[*out_idx].ca_g_q16 = (uint32_t)vals[4];
-    fcfg[*out_idx].start_ca = (int)(vals[5] != 0);
+    fcfg[*out_idx].start_ca = (int)vals[5];
     fcfg[*out_idx].stagger_ms = (uint32_t)vals[6];
     if (count >= 8 && vals[7] > 0)
         fcfg[*out_idx].bytes = vals[7];
@@ -120,11 +120,14 @@ static int parse_flow_spec(const char *spec, struct flow_cfg *fcfg, int *out_idx
 
 static void apply_flow_cfg(struct transfer *a, struct transfer *b, const struct flow_cfg *cfg)
 {
-    if (cfg->start_ca) {
+    if (cfg->start_ca == 1) {
         a->stream->cwnd = MSS;
         a->stream->ssthresh = MSS;
         b->stream->cwnd = MSS;
         b->stream->ssthresh = MSS;
+    } else if (cfg->start_ca > 1) {
+        a->stream->ssthresh = (uint32_t)cfg->start_ca * MSS;
+        b->stream->ssthresh = (uint32_t)cfg->start_ca * MSS;
     }
     if (cfg->budget_pacing >= 0) {
         a->stream->budget_pacing = (uint8_t)cfg->budget_pacing;
