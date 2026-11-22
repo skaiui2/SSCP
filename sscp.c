@@ -621,7 +621,8 @@ static void sscp_send_window_probe(struct sscp_stream *ss)
  */
 int sscp_retransmit_gap(struct sscp_stream *ss,
                         uint32_t gap_start,
-                        uint32_t gap_end)
+                        uint32_t gap_end,
+                        int max_frags)
 {
     struct list_node *n;
     int sent_frags = 0;
@@ -650,7 +651,7 @@ int sscp_retransmit_gap(struct sscp_stream *ss,
         sscp_output_data(ss, sb); 
         sent_frags++;
 
-        if (sent_frags >= RETRANS_GAP_MAX)
+        if (sent_frags >= max_frags)
             return sent_frags;
 
     }
@@ -1174,10 +1175,17 @@ static void sscp_process_ack(struct sscp_stream *ss,
         if (new_gap) {
             sscp_enter_recovery(ss);
 
-            rexmit_sent += sscp_retransmit_gap(ss, ack, sack);
+            rexmit_sent += sscp_retransmit_gap(ss, ack, sack, RETRANS_GAP_MAX);
 
             ss->last_gap_rexmit_ack = ack;
             ss->last_gap_rexmit_valid = 1;
+        } else if (ss->fr_active) {
+            /*
+             * RFC 6675 Sec 5 (NextSeg / packet conservation): each subsequent
+             * SACK indicates one segment left the pipe, clocking out at most
+             * 1 un-retransmitted segment from [ack, sack) without burst storm.
+             */
+            rexmit_sent += sscp_retransmit_gap(ss, ack, sack, 1);
         }
     }
 
@@ -1206,7 +1214,7 @@ static void sscp_process_ack(struct sscp_stream *ss,
             sscp_enter_recovery(ss);
 
             if (sscp_sack_gap_valid(ss, ack, sack)) {
-                rexmit_sent += sscp_retransmit_gap(ss, ack, sack);
+                rexmit_sent += sscp_retransmit_gap(ss, ack, sack, RETRANS_GAP_MAX);
 
                 ss->last_gap_rexmit_ack = ack;
                 ss->last_gap_rexmit_valid = 1;
