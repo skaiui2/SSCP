@@ -37,13 +37,13 @@ python3 artifact/scripts/build_ccr_figures.py
 | :--- | :--- | :--- | :--- |
 | **Fig. 1b** (SS gain sweep, $q=\infty$) | SSCP virtual | `ss_gain_sweep.csv` | `scripts/run_sscp_virtual.py` |
 | **Fig. 2a & 2b** (Limit cycle & CUBIC trace) | Analytical / SSCP virtual | `limit_cycle.csv`, `cubic_epoch_trace.csv` | `scripts/run_sscp_virtual.py` + `scripts/build_ccr_figures.py` |
-| **Q1** (Fold-on-Send vs. Oracle $\mathcal{B}(L)$) | SSCP virtual | — | `scripts/run_sscp_virtual.py --quick` |
+| **Q1** (Fold-on-Send vs. Full-Window Reference $\mathcal{B}(L)$) | SSCP virtual | — | `scripts/run_sscp_virtual.py --quick` |
 | **Table 1** (vs. static $(2\ln 2, 1)$) | SSCP virtual | — | `scripts/run_sscp_virtual.py --quick` |
-| **Table 2 & Fig. 3a** (30-seed CUBIC & $q=20$) | SSCP virtual | `virtual_single_summary.csv` | `scripts/run_sscp_virtual.py --full` |
+| **Table 2 & Fig. 3a** (30-seed CUBIC & $q=20$) | SSCP virtual | `virtual_single_summary.csv`, `virtual_single_runs.csv` | `scripts/run_sscp_virtual.py --full` |
 | **Table 3 & Q1/Q5** (TCP loss runs) | ns-3.46.1 TCP | `ns3_summary.csv` | `patches/ns3-3.46.1-budget-o1.patch` + `scripts/ns3/run_experiments.py` |
 | **Fig. 3b & Q5** (20-seed QUIC CUBIC) | picoquic (`9491698`) | `picoquic_multiseed_runs.csv` | `patches/picoquic-9491698-budget-o1.patch` + `scripts/picoquic/` |
 | **Fig. 4a & Q6** (Multi-flow CUBIC) | SSCP virtual | `virtual_multiflow_summary.csv` | `scripts/run_sscp_virtual.py --full` |
-| **Fig. 4b & Q6** (Live wire bursts & CV) | Linux 6.8 netns UDP | `linux_dual_tap_summary.json` | `scripts/linux_udp/udp_bench.c` + `exp_linux_option_a.py` |
+| **Fig. 4b & Q6** (Live wire bursts & CV) | Linux 6.8 netns UDP | `linux_dual_tap_summary.json`, `linux_dual_tap_runs.csv` | `scripts/linux_udp/udp_bench.c` + `exp_linux_option_a.py` |
 
 ---
 
@@ -63,7 +63,7 @@ python3 artifact/scripts/run_sscp_virtual.py --build-dir test/build --quick
 python3 artifact/scripts/run_sscp_virtual.py --build-dir test/build --full
 ```
 
-**Pass criteria:** All `10/10` virtual CTests pass; Q1 median relative error against the exact ACK-replay oracle is `< 0.01%` in Slow Start and `< 1.0%` in pure Reno CA; Table 1 reproduces `BudgetO1` beating static `(2 ln 2, 1)` by `~92-96 ms` at `10 Mbps, q=4,8` (`11` vs `12` and `7` vs `8` drops) and cutting P95 queueing delay by `5.36%` at `q=16,32`.
+**Pass criteria:** All `10/10` virtual CTests pass; Q1 median relative error against the saturated full-window ACK-replay reference is `< 0.01%` in Slow Start and `< 1.0%` in pure Reno CA; Table 1 reproduces `BudgetO1` beating static `(2 ln 2, 1)` by `~92-96 ms` at `10 Mbps, q=4,8` (`11` vs `12` and `7` vs `8` drops) and cutting P95 queueing delay by `5.36%` at `q=16,32`.
 
 ### B. ns-3.46.1 TCP Loss Runs (Table 3 & Q1/Q5)
 
@@ -104,4 +104,4 @@ gcc -O2 -DSSCP_TICK_SCALE=1000U \
 sudo python3 exp_linux_option_a.py
 ```
 
-**Pass criteria:** On `100 Mbps, 50 ms RTT, q=350, 8 MiB, spin=1500 us` (`n=3`), `BudgetO1` reduces pre-bottleneck wire micro-bursts (`<50 us`) from `9.20%` (`Linux 2/1.2`) to `~2.2%` (`Analytic (2 ln 2, 1)`: `~2.4%`), and cuts wire tail `CV500` from `~1.00` down to `~0.19` (`Analytic (2 ln 2, 1)`: `~0.20`).
+**Pass criteria:** On `100 Mbps, 50 ms RTT, q=350, 8 MiB, spin=1500 us` (`n=3`), `BudgetO1` reduces pre-bottleneck wire micro-bursts (`<50 us`) from `8.9%` (`Linux 2/1.2`) to `1.9%` (`Analytic (2 ln 2, 1)`: `2.1%`), and cuts wire tail `CV500` from `~0.97` down to `~0.20` (`Analytic (2 ln 2, 1)`: `~0.14`), matching `linux_dual_tap_runs.csv` identically.
