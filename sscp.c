@@ -648,6 +648,7 @@ int sscp_retransmit_gap(struct sscp_stream *ss,
 
         sb->retransmitted = 1;
         ss->loss_cnt++;
+        ss->rtx_cnt++;
         sscp_output_data(ss, sb); 
         sent_frags++;
 
@@ -686,6 +687,7 @@ static int sscp_retransmit(struct sscp_stream *ss)
 
         sb->retransmitted = 1;
         ss->loss_cnt++;
+        ss->rtx_cnt++;
         sscp_output_data(ss, sb);
         sent++;
 
@@ -2309,7 +2311,7 @@ static void sscp_update_cwnd_fast(struct sscp_stream *ss,
 
 static void sscp_prob_init(struct sscp_stream *ss)
 {
-    ss->cwnd = MSS;
+    ss->cwnd = SSCP_IW_SEGS * MSS;
 
     ss->sent_cnt = 0;
     ss->loss_cnt = 0;
@@ -2365,7 +2367,7 @@ static uint64_t sscp_prob_pacing_work(struct sscp_stream *ss,
 
 static void sscp_aimd_init(struct sscp_stream *ss)
 {
-    ss->cwnd = MSS;
+    ss->cwnd = SSCP_IW_SEGS * MSS;
     ss->cwnd_cnt = 0;
     ss->ssthresh = CWND_WIN_MAX;
 

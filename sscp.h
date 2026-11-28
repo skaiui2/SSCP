@@ -37,11 +37,14 @@ struct sscp_timer {
 #define SSCP_DUMP_HDR  0
 
 #define RETRANS_COUNT_MAX 1000
-#define SSCP_RTO_INIT (1000U * (SSCP_TICK_SCALE))
+#define SSCP_RTO_INIT (500U * (SSCP_TICK_SCALE))
 #define SSCP_RTO_MIN (200U * (SSCP_TICK_SCALE))
 #define SSCP_RTO_MAX (2000U * (SSCP_TICK_SCALE))
 #define RETRANS_RECO_MAX 1
 #define RETRANS_GAP_MAX  4
+#ifndef SSCP_IW_SEGS
+#define SSCP_IW_SEGS     10U
+#endif
 #ifndef SSCP_RECV_LIMIT
 #define SSCP_RECV_LIMIT (1 << 24)
 #endif
@@ -54,7 +57,9 @@ struct sscp_timer {
 #ifndef CWND_WIN_MAX
 #define CWND_WIN_MAX  (1 << 20)
 #endif
+#ifndef MTU
 #define MTU 1460
+#endif
 #define PERSIST_INTERVAL (200U * (SSCP_TICK_SCALE))
 #define SSCP_PACING_SHIFT 32U
 #define SSCP_GAIN_ONE_Q16 (1U << 16)
@@ -205,6 +210,7 @@ struct sscp_stream {
 
     uint32_t sent_cnt;
     uint32_t loss_cnt;
+    uint32_t rtx_cnt;                   // monotonic retransmitted segment counter
     uint32_t p_ema;
     uint32_t p;
 
