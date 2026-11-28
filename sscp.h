@@ -47,10 +47,10 @@ struct sscp_timer {
 #define SSCP_IW_SEGS     10U
 #endif
 #ifndef SSCP_ACK_BATCH_MAX
-#define SSCP_ACK_BATCH_MAX  8U
+#define SSCP_ACK_BATCH_MAX  2U
 #endif
 #ifndef SSCP_ACK_DELAY_MS
-#define SSCP_ACK_DELAY_MS   (15U * (SSCP_TICK_SCALE))
+#define SSCP_ACK_DELAY_MS   (4U * (SSCP_TICK_SCALE))
 #endif
 #ifndef SSCP_RECV_LIMIT
 #define SSCP_RECV_LIMIT (1 << 24)

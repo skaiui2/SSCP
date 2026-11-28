@@ -394,6 +394,22 @@ static void sscp_timer_ack_cb(void *arg)
     sscp_output_ack(ss, NULL);
 }
 
+static uint32_t sscp_ack_delay(const struct sscp_stream *ss)
+{
+    uint32_t delay;
+    uint32_t q_rtt;
+
+    delay = SSCP_ACK_DELAY_MS;
+    if (ss->srtt > 0) {
+        q_rtt = ss->srtt >> 2;
+        if (q_rtt < delay)
+            delay = q_rtt;
+    }
+    if (delay < SSCP_TICK_SCALE)
+        delay = SSCP_TICK_SCALE;
+    return delay;
+}
+
 static void sscp_schedule_ack(struct sscp_stream *ss,
                               struct sscp_hdr *data_sh,
                               int immediate)
@@ -402,7 +418,8 @@ static void sscp_schedule_ack(struct sscp_stream *ss,
         ss->ack_echo_time = data_sh->time_val;
     if (ss->ack_pending < UINT16_MAX)
         ss->ack_pending++;
-    if (immediate || ss->ack_pending >= SSCP_ACK_BATCH_MAX) {
+    if (immediate || ss->fr_active || ss->rcv_buf_q.rb_node != NULL ||
+        ss->ack_pending >= SSCP_ACK_BATCH_MAX) {
         sscp_output_ack(ss, data_sh);
         return;
     }
@@ -410,7 +427,7 @@ static void sscp_schedule_ack(struct sscp_stream *ss,
         sscp_timer_create(&ss->t_ack,
                           sscp_timer_ack_cb,
                           ss,
-                          SSCP_ACK_DELAY_MS);
+                          sscp_ack_delay(ss));
     }
 }
 
