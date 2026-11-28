@@ -2221,8 +2221,11 @@ static void sscp_update_cwnd_fast(struct sscp_stream *ss,
     float w = (float)ss->cwnd;
 
     if (ss->cc_phase == SSCP_CC_PHASE_INC) {
-        if (ss->cong_q >= SSCP_Q_HIGH_U16)
+        if (ss->cong_q >= SSCP_Q_HIGH_U16) {
             ss->cc_phase = SSCP_CC_PHASE_DEC;
+            if (ss->cong_q_ema >= SSCP_Q_HIGH_U16 && ss->ssthresh > ss->cwnd)
+                ss->ssthresh = ss->cwnd;
+        }
     } else {
         if (ss->cong_q <= SSCP_Q_LOW_U16)
         ss->cc_phase = SSCP_CC_PHASE_INC;
@@ -2244,9 +2247,9 @@ static void sscp_update_cwnd_fast(struct sscp_stream *ss,
         {
             float weight = 1.0f - x * x;
             float denom = w > 1.0f ? w : 1.0f;
-            float add =
-                weight *
-                ((float)MSS * (float)acked / denom);
+            float add = (ss->cwnd < ss->ssthresh)
+                ? (weight * (float)acked)
+                : (weight * ((float)MSS * (float)acked / denom));
 
             if (add < 1.0f)
                 add = 1.0f;
@@ -2327,7 +2330,7 @@ static void sscp_prob_init(struct sscp_stream *ss)
 
     ss->cc_phase = SSCP_CC_PHASE_INC;
 
-    ss->ssthresh = 0;
+    ss->ssthresh = CWND_WIN_MAX;
     ss->recover_seq = 0;
     ss->fr_active = 0;
 }
@@ -2359,9 +2362,14 @@ static uint32_t sscp_prob_on_rtt(struct sscp_stream *ss)
     return rtt;
 }
 
+static uint64_t sscp_aimd_pacing_work(struct sscp_stream *ss,
+                                      uint32_t frag_len);
+
 static uint64_t sscp_prob_pacing_work(struct sscp_stream *ss,
                                       uint32_t frag_len)
 {
+    if (ss->cc_phase == SSCP_CC_PHASE_INC && ss->cwnd < ss->ssthresh)
+        return sscp_aimd_pacing_work(ss, frag_len);
     return ((uint64_t)frag_len << 32) / ss->cwnd;
 }
 
