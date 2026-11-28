@@ -190,18 +190,18 @@ static void sscp_dump_hdr(struct sscp_stream *ss,
                          const struct sscp_hdr *h)
 {
 #if SSCP_DUMP_HDR
-    uint32_t seq  = ntohl(h->seq);
-    uint32_t ack  = ntohl(h->ack);
-    uint32_t sack = ntohl(h->sack);
-    uint32_t wnd  = ntohl(h->wnd);
-    uint32_t len  = ntohs(h->len);
+    uint32_t seq    = ntohl(h->seq);
+    uint32_t ack    = ntohl(h->ack);
+    uint32_t pkt_id = ntohl(h->pkt_id);
+    uint32_t wnd    = ntohl(h->wnd);
+    uint32_t len    = ntohs(h->len);
 
     printf("{\"t\":%u,"
            "\"type\":\"hdr\","
            "\"dir\":\"%s\","
            "\"seq\":%u,"
            "\"ack\":%u,"
-           "\"sack\":%u,"
+           "\"pkt_id\":%u,"
            "\"len\":%u,"
            "\"wnd\":%u,"
            "\"flags\":%u,",
@@ -209,7 +209,7 @@ static void sscp_dump_hdr(struct sscp_stream *ss,
            dir,
            seq,
            ack,
-           sack,
+           pkt_id,
            len,
            wnd,
            h->flags
@@ -324,6 +324,22 @@ void sscp_timer_process(void)
 #endif
 }
 
+static void sscp_rto_reset_snd_q(struct sscp_stream *ss, int clear_sack)
+{
+    struct list_node *n;
+    struct sscp_buf *sb;
+
+    for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
+        sb = container_of(n, struct sscp_buf, list);
+        if (clear_sack)
+            sb->sacked = 0;
+        if (!sb->sacked)
+            sb->retransmitted = 0;
+    }
+    if (clear_sack)
+        ss->sacked_bytes = 0;
+}
+
 /*
  *Update cwnd
  *If retrans too many, we close.
@@ -343,6 +359,8 @@ static void sscp_timer_retrans_cb(void *arg)
     ss->pacing_gain_q16 = SSCP_GAIN_ONE_Q16;
     ss->pacing_next_tick = sscp_now_time();
 
+    /* First RTO keeps SACKed state; second consecutive RTO clears it (RFC 2018). */
+    sscp_rto_reset_snd_q(ss, ss->timeout_count >= 1);
     sscp_retransmit(ss);
 
     ss->timeout_count++;
@@ -449,20 +467,6 @@ static uint32_t random32(void)
 }
 
 /*
- *If our data is non orider, must rcv_buf_q first and rcv_data_q is not neibor
- *So (rcv_data_q last, rcv_buf_q first) is we need.
- */
-static inline uint32_t sscp_calc_sack(struct sscp_stream *ss)
-{
-    if (ss->rcv_buf_q.rb_node == NULL)
-        return ss->rcv_nxt;
-
-    struct rb_node *n = rb_first(&ss->rcv_buf_q);
-    struct sscp_buf *first = container_of(n, struct sscp_buf, rb);
-    return first->seq;
-}
-
-/*
  * Just alloc, you can replace memory alloc.
 */
 static struct sscp_buf *sscp_buf_alloc(uint32_t len)
@@ -518,14 +522,15 @@ struct sscp_stream *sscp_stream_alloc(struct sscp_transport_class *st_class, int
             .state = SSCP_CLOSED,
             .iss = 0,
             .rcv_nxt = 0,
+            .rcv_pkt_nxt = 1U,
             .snd_seq_q = 0,
             .snd_nxt = 0,
             .snd_una = 0,
+            .snd_pkt_seq = 0,
             .cwnd = MTU, 
             .dup_acks = 0,
-            .last_gap_rexmit_ack = 0,
-            .last_gap_rexmit_valid = 0,
             .fr_active = 0,
+            .sacked_bytes = 0,
             .packet_bytes = 0,
             .packet_count = 0,
             .sent_cnt = 0,
@@ -622,6 +627,30 @@ static inline void sscp_update_rcv_wnd(struct sscp_stream *s)
         s->rcv_wnd = s->sb_hiwat - s->sb_cc;
 }
 
+static uint16_t sscp_checksum(const void *buf, size_t len)
+{
+    const uint8_t *p;
+    uint32_t sum;
+    uint16_t word;
+
+    p = (const uint8_t *)buf;
+    sum = 0;
+    while (len > 1) {
+        memcpy(&word, p, sizeof(word));
+        sum += word;
+        if (sum & 0x80000000U)
+            sum = (sum & 0xFFFFU) + (sum >> 16);
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += (uint32_t)(*p);
+    while (sum >> 16)
+        sum = (sum >> 16) + (sum & 0xFFFFU);
+
+    return (uint16_t)(~sum);
+}
+
 /*
  * When no respond, we need to get information from remote.
  * So ping it, get wnd or other.
@@ -631,7 +660,6 @@ static void sscp_send_window_probe(struct sscp_stream *ss)
     struct sscp_hdr hdr = {
             .seq   = htonl(ss->snd_nxt),
             .ack   = htonl(ss->rcv_nxt),
-            .sack  = htonl(sscp_calc_sack(ss)),
             .wnd   = htonl(ss->rcv_wnd),
             .len   = 0,
             .cksum = 0,
@@ -639,80 +667,38 @@ static void sscp_send_window_probe(struct sscp_stream *ss)
             .fd    = ss->dst_fd,
     };
 
-    hdr.cksum = in_checksum(&hdr, sizeof(hdr));
+    hdr.cksum = sscp_checksum(&hdr, sizeof(hdr));
     sscp_dump_hdr(ss, "WINDOWS_PING", &hdr);
     ss->st_class->send(ss->st_class->user, &hdr, sizeof(hdr));
 }
 
 /*
- * SACK-based selective retransmit.
- * Resend all bytes in [gap_start, gap_end) from snd_q.
- * rely on cwnd path for congestion control.
- */
-int sscp_retransmit_gap(struct sscp_stream *ss,
-                        uint32_t gap_start,
-                        uint32_t gap_end,
-                        int max_frags)
-{
-    struct list_node *n;
-    int sent_frags = 0;
-
-    for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
-        struct sscp_buf *sb = container_of(n, struct sscp_buf, list);
-        uint32_t total = sb->len - sizeof(struct sscp_hdr);
-
-        uint32_t seg_start = sb->seq;
-        uint32_t seg_end   = sb->seq + total;
-
-        // skip segments fully before gap
-        if (SEQ_LEQ(seg_end, gap_start))
-            continue;
-
-        // stop when segment starts after gap
-        if (SEQ_GEQ(seg_start, gap_end))
-            return sent_frags;
-
-        // RFC 6675: each lost segment is fast-retransmitted at most once; RTO recovers dropped rexmits.
-        if (sb->retransmitted)
-            continue;
-
-        sb->retransmitted = 1;
-        ss->loss_cnt++;
-        ss->rtx_cnt++;
-        sscp_output_data(ss, sb); 
-        sent_frags++;
-
-        if (sent_frags >= max_frags)
-            return sent_frags;
-
-    }
-
-    return sent_frags;
-}
-
-/*
  * RTO-based retransmit (safe version).
- * Only retransmit the first unacked segment (snd_una).
+ * Only retransmit the first un-SACKed unacked segment (snd_una).
  * This avoids queue explosion and RTO storms.
  */
 static int sscp_retransmit(struct sscp_stream *ss)
 {
-    uint32_t max_frags = 1 << ss->rto_recovery;
+    uint32_t max_frags;
+    uint32_t sent;
+    struct list_node *n;
+    struct sscp_buf *sb;
+    uint32_t total;
+    uint32_t seg_end;
 
+    max_frags = 1U << ss->rto_recovery;
     if (max_frags > RETRANS_RECO_MAX)
         max_frags = RETRANS_RECO_MAX;
 
-    uint32_t sent = 0;
-
-    struct list_node *n;
+    sent = 0;
     for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
-        struct sscp_buf *sb = container_of(n, struct sscp_buf, list);
-        uint32_t total = sb->len - sizeof(struct sscp_hdr);
-
-        uint32_t seg_start = sb->seq;
-        uint32_t seg_end   = sb->seq + total;
+        sb = container_of(n, struct sscp_buf, list);
+        total = (uint32_t)(sb->len - sizeof(struct sscp_hdr));
+        seg_end = sb->seq + total;
 
         if (SEQ_LEQ(seg_end, ss->snd_una))
+            continue;
+        if (sb->sacked)
             continue;
 
         sb->retransmitted = 1;
@@ -736,13 +722,12 @@ static void sscp_output_connect(struct sscp_stream *ss)
     struct sscp_hdr hdr = {
         .seq = htonl(ss->iss),
         .ack = 0,
-        .sack = htonl(sscp_calc_sack(ss)),
         .wnd = htonl(ss->rcv_wnd),
         .len = 0,
         .flags = SSCP_FLAG_CONNECT,
         .fd = ss->dst_fd,
     };
-    hdr.cksum = in_checksum(&hdr, sizeof(hdr));
+    hdr.cksum = sscp_checksum(&hdr, sizeof(hdr));
     sscp_debug_dump_tx("CONNECT", &hdr, sizeof(hdr));
     sscp_dump_hdr(ss, "CONNECT", &hdr);
     ss->st_class->send(ss->st_class->user, &hdr, sizeof(hdr));
@@ -756,14 +741,13 @@ static void sscp_output_connect_ack(struct sscp_stream *ss)
     struct sscp_hdr hdr = {
         .seq = htonl(ss->snd_nxt),
         .ack = htonl(ss->rcv_nxt),
-        .sack = htonl(sscp_calc_sack(ss)),
         .wnd = htonl(ss->rcv_wnd),
         .len = 0,
         .flags = SSCP_FLAG_CONNECT_ACK,
         .fd = ss->dst_fd,
     };
     hdr.cksum = 0;
-    hdr.cksum = in_checksum(&hdr, sizeof(hdr));
+    hdr.cksum = sscp_checksum(&hdr, sizeof(hdr));
     sscp_debug_dump_tx("CONNECT_ACK", &hdr, sizeof(hdr));
     sscp_dump_hdr(ss, "CONNECT_ACK", &hdr);
     ss->st_class->send(ss->st_class->user, &hdr, sizeof(hdr));
@@ -775,13 +759,12 @@ static void sscp_output_fin_first(struct sscp_stream *ss)
 
     hdr.seq  = htonl(ss->snd_nxt);
     hdr.ack  = htonl(ss->rcv_nxt);
-    hdr.sack = htonl(sscp_calc_sack(ss));
     hdr.wnd  = htonl(ss->rcv_wnd);
     hdr.len  = 0;
     hdr.flags = SSCP_FLAG_FIN | SSCP_FLAG_ACK;
     hdr.fd   = ss->dst_fd;
     hdr.cksum = 0;
-    hdr.cksum = in_checksum(&hdr, sizeof(hdr));
+    hdr.cksum = sscp_checksum(&hdr, sizeof(hdr));
 
     sscp_debug_dump_tx("FIN_ACK", &hdr, sizeof(hdr));
     sscp_dump_hdr(ss, "FIN_ACK", &hdr);
@@ -796,13 +779,12 @@ static void sscp_output_fin_retrans(struct sscp_stream *ss)
 
     hdr.seq  = htonl(ss->snd_nxt - 1);  
     hdr.ack  = htonl(ss->rcv_nxt);
-    hdr.sack = htonl(sscp_calc_sack(ss));
     hdr.wnd  = htonl(ss->rcv_wnd);
     hdr.len  = 0;
     hdr.flags = SSCP_FLAG_FIN | SSCP_FLAG_ACK;
     hdr.fd   = ss->dst_fd;
     hdr.cksum = 0;
-    hdr.cksum = in_checksum(&hdr, sizeof(hdr));
+    hdr.cksum = sscp_checksum(&hdr, sizeof(hdr));
 
     sscp_debug_dump_tx("FIN_RETRANS", &hdr, sizeof(hdr));
     sscp_dump_hdr(ss, "FIN_RETRANS", &hdr);
@@ -912,6 +894,7 @@ static void sscp_process_data(struct sscp_stream *s, struct sscp_buf *sb)
     }
 
     sb->seq = seq;
+    sb->pkt_id = ntohl(sh->pkt_id);
     uint32_t end = seq + payload_len;
 
     // remove obsolete out-of-order segments already covered by rcv_nxt
@@ -942,6 +925,8 @@ static void sscp_process_data(struct sscp_stream *s, struct sscp_buf *sb)
     // in-order segment
     if (SEQ_EQ(seq, s->rcv_nxt)) {
         s->rcv_nxt += payload_len;
+        if (SEQ_GEQ(sb->pkt_id, s->rcv_pkt_nxt))
+            s->rcv_pkt_nxt = sb->pkt_id + 1U;
         queue_enqueue(&s->rcv_data_q, &sb->list);
         s->sb_cc += payload_len;
         sscp_update_rcv_wnd(s);
@@ -963,6 +948,8 @@ static void sscp_process_data(struct sscp_stream *s, struct sscp_buf *sb)
             rb_remove_node(&s->rcv_buf_q, &b->rb);
             queue_enqueue(&s->rcv_data_q, &b->list);
             s->rcv_nxt += b_plen;
+            if (SEQ_GEQ(b->pkt_id, s->rcv_pkt_nxt))
+                s->rcv_pkt_nxt = b->pkt_id + 1U;
             s->sb_cc += b_plen;
             sscp_update_rcv_wnd(s);
             filled_hole = 1;
@@ -1018,6 +1005,13 @@ void sscp_snd_buf_free(struct sscp_stream *ss, uint32_t ack)
         uint32_t end_seq     = sb->seq + payload_len;
 
         if (SEQ_LEQ(end_seq, ack)) {
+            if (sb->sacked) {
+                if (ss->sacked_bytes >= payload_len)
+                    ss->sacked_bytes -= payload_len;
+                else
+                    ss->sacked_bytes = 0;
+                sb->sacked = 0;
+            }
             ss->pacing_work_sum_q32 -= sb->pacing_work_q32;
             list_remove(cur);
             sscp_buf_free(ss, sb);
@@ -1126,19 +1120,207 @@ static inline void sscp_enter_recovery(struct sscp_stream *ss)
         ss->cc_on_loss(ss);
 }
 
-static inline int sscp_sack_gap_valid(struct sscp_stream *ss,
-                                     uint32_t ack,
-                                     uint32_t sack)
+static uint16_t sscp_sack_build(struct sscp_stream *ss, uint8_t *out)
 {
-    // ack < sack <= snd_nxt
-    if (!SEQ_GT(sack, ack))
+    uint32_t map[SSCP_SACK_MAX_WORDS];
+    struct sscp_sack_ext ext;
+    struct rb_node *n;
+    struct sscp_buf *b;
+    uint32_t base_id;
+    uint32_t idx;
+    uint32_t word;
+    uint16_t map_words;
+    uint16_t i;
+
+    if (ss->rcv_buf_q.rb_node == NULL)
         return 0;
 
-    //The peer cannot SACK data beyond what we have sent.
-    if (SEQ_GT(sack, ss->snd_nxt))
+    memset(map, 0, sizeof(map));
+    base_id = ss->rcv_pkt_nxt;
+    map_words = 0;
+
+    for (n = rb_first(&ss->rcv_buf_q); n != NULL; n = rb_next(n)) {
+        b = container_of(n, struct sscp_buf, rb);
+        if (SEQ_LT(b->pkt_id, base_id))
+            continue;
+        idx = b->pkt_id - base_id;
+        if (idx >= SSCP_SACK_MAX_WORDS * 32U)
+            break;
+        word = idx >> 5;
+        map[word] |= (1U << (idx & 31U));
+        if ((uint16_t)(word + 1U) > map_words)
+            map_words = (uint16_t)(word + 1U);
+    }
+
+    if (map_words == 0)
         return 0;
 
+    ext.base_id = htonl(base_id);
+    ext.map_words = htons(map_words);
+    memcpy(out, &ext, sizeof(ext));
+    for (i = 0; i < map_words; ++i) {
+        word = htonl(map[i]);
+        memcpy(out + sizeof(ext) + (size_t)i * sizeof(uint32_t),
+               &word, sizeof(word));
+    }
+
+    return (uint16_t)(sizeof(ext) + (size_t)map_words * sizeof(uint32_t));
+}
+
+static int sscp_sack_decode(const struct sscp_buf *sb_ack,
+                            uint32_t *base_id,
+                            uint16_t *map_words,
+                            uint32_t *map)
+{
+    const struct sscp_hdr *sh;
+    struct sscp_sack_ext ext;
+    const uint8_t *p;
+    uint16_t ext_len;
+    uint16_t words;
+    uint16_t i;
+    uint32_t word;
+
+    if (!sb_ack || sb_ack->len < sizeof(*sh))
+        return 0;
+
+    sh = (const struct sscp_hdr *)sb_ack->data;
+    if (!(sh->flags & SSCP_FLAG_SACK))
+        return 0;
+
+    ext_len = ntohs(sh->len);
+    if (ext_len < sizeof(ext) ||
+        sb_ack->len < sizeof(*sh) + (size_t)ext_len)
+        return 0;
+
+    p = sb_ack->data + sizeof(*sh);
+    memcpy(&ext, p, sizeof(ext));
+    words = ntohs(ext.map_words);
+    if (words == 0 || words > SSCP_SACK_MAX_WORDS)
+        return 0;
+    if (ext_len != sizeof(ext) + (size_t)words * sizeof(uint32_t))
+        return 0;
+
+    p += sizeof(ext);
+    for (i = 0; i < words; ++i) {
+        memcpy(&word, p + (size_t)i * sizeof(uint32_t), sizeof(word));
+        map[i] = ntohl(word);
+    }
+
+    *base_id = ntohl(ext.base_id);
+    *map_words = words;
     return 1;
+}
+
+static int sscp_sack_highest_id(uint32_t base_id,
+                                uint16_t map_words,
+                                const uint32_t *map,
+                                uint32_t max_id,
+                                uint32_t *out_highest)
+{
+    uint32_t w;
+    uint32_t word;
+    uint32_t id;
+    int bit;
+
+    for (w = map_words; w > 0; --w) {
+        word = map[w - 1U];
+        if (word == 0)
+            continue;
+        for (bit = 31; bit >= 0; --bit) {
+            if (!(word & (1U << (unsigned)bit)))
+                continue;
+            id = base_id + ((w - 1U) << 5) + (uint32_t)bit;
+            if (SEQ_LEQ(id, max_id)) {
+                *out_highest = id;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int sscp_sack_bit(uint32_t base_id,
+                         uint16_t map_words,
+                         const uint32_t *map,
+                         uint32_t id)
+{
+    uint32_t idx;
+
+    if (SEQ_LT(id, base_id))
+        return 0;
+    idx = id - base_id;
+    if (idx >= (uint32_t)map_words * 32U)
+        return 0;
+    return (map[idx >> 5] & (1U << (idx & 31U))) != 0;
+}
+
+static int sscp_sack_mark_and_retransmit(struct sscp_stream *ss,
+                                         uint32_t base_id,
+                                         uint16_t map_words,
+                                         const uint32_t *map,
+                                         uint32_t highest_id)
+{
+    struct list_node *n;
+    struct sscp_buf *sb;
+    uint32_t payload_len;
+    int sent_frags;
+
+    sent_frags = 0;
+    for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
+        sb = container_of(n, struct sscp_buf, list);
+        if (SEQ_GEQ(sb->seq, ss->snd_nxt))
+            break;
+        if (SEQ_GT(sb->pkt_id, highest_id))
+            break;
+
+        payload_len = (uint32_t)(sb->len - sizeof(struct sscp_hdr));
+        if (sscp_sack_bit(base_id, map_words, map, sb->pkt_id)) {
+            if (!sb->sacked) {
+                sb->sacked = 1;
+                ss->sacked_bytes += payload_len;
+            }
+            continue;
+        }
+
+        if (sb->sacked || sb->retransmitted || sent_frags >= RETRANS_GAP_MAX)
+            continue;
+        if (sb->pkt_id != base_id && SEQ_LT(highest_id, sb->pkt_id + 3U))
+            continue;
+
+        sb->retransmitted = 1;
+        ss->loss_cnt++;
+        ss->rtx_cnt++;
+        sscp_output_data(ss, sb);
+        sent_frags++;
+    }
+
+    return sent_frags;
+}
+
+static int sscp_handle_sack(struct sscp_stream *ss,
+                            const struct sscp_buf *sb_ack)
+{
+    uint32_t map[SSCP_SACK_MAX_WORDS];
+    uint32_t base_id;
+    uint32_t highest_id;
+    uint16_t map_words;
+    struct sscp_buf *head;
+
+    if (list_empty(&ss->snd_q))
+        return 0;
+    if (!sscp_sack_decode(sb_ack, &base_id, &map_words, map))
+        return 0;
+    if (!sscp_sack_highest_id(base_id, map_words, map,
+                              ss->snd_pkt_seq, &highest_id))
+        return 0;
+
+    head = container_of(ss->snd_q.next, struct sscp_buf, list);
+    if (SEQ_LT(highest_id, head->pkt_id))
+        return 0;
+
+    sscp_enter_recovery(ss);
+    return sscp_sack_mark_and_retransmit(ss, base_id, map_words,
+                                         map, highest_id);
 }
 
 /* 
@@ -1148,11 +1330,13 @@ static inline int sscp_sack_gap_valid(struct sscp_stream *ss,
  * Handle ACK: update RTT, free bufferr, run SB.
  */
 static void sscp_process_ack(struct sscp_stream *ss,
+                            struct sscp_buf *sb_ack,
                             uint32_t ack,
-                            uint32_t wnd,
-                            uint32_t sack)
+                            uint32_t wnd)
 {
     uint32_t old_una;
+    int rexmit_sent;
+
     if (SEQ_LT(ack, ss->snd_una) || SEQ_GT(ack, ss->snd_nxt))
         goto out;
 
@@ -1176,7 +1360,7 @@ static void sscp_process_ack(struct sscp_stream *ss,
             ss->pacing_next_tick = now + ss->srtt;
         }
 
-        sscp_update_loss(ss);    
+        sscp_update_loss(ss);
 
         if (ss->fr_active &&
             SEQ_GEQ(ack, ss->recover_seq)) {
@@ -1186,9 +1370,10 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
         /*
          * RFC 5681 Sec 3.2 / RFC 6675 Sec 5: partial ACKs within a recovery
-         * episode (ack < recover_seq) must not trigger normal cwnd growth.
+         * episode (ack < recover_seq) must not trigger normal cwnd growth
+         * for loss-based CCAs; PROB adapts continuously from delay/loss.
          */
-        if (!ss->fr_active && ss->cc_on_ack)
+        if ((!ss->fr_active || ss->cc_id == SSCP_CC_PROB) && ss->cc_on_ack)
             ss->cc_on_ack(ss, acked);
 
         ss->rto_recovery = 0;
@@ -1203,29 +1388,7 @@ static void sscp_process_ack(struct sscp_stream *ss,
 
     sscp_snd_buf_free(ss, ack);
 
-    int rexmit_sent = 0;
-
-    if (sscp_sack_gap_valid(ss, ack, sack)) {
-        int new_gap =
-            !ss->last_gap_rexmit_valid ||
-            SEQ_GT(ack, ss->last_gap_rexmit_ack);
-
-        if (new_gap) {
-            sscp_enter_recovery(ss);
-
-            rexmit_sent += sscp_retransmit_gap(ss, ack, sack, RETRANS_GAP_MAX);
-
-            ss->last_gap_rexmit_ack = ack;
-            ss->last_gap_rexmit_valid = 1;
-        } else if (ss->fr_active) {
-            /*
-             * RFC 6675 Sec 5 (NextSeg / packet conservation): each subsequent
-             * SACK indicates one segment left the pipe, clocking out at most
-             * 1 un-retransmitted segment from [ack, sack) without burst storm.
-             */
-            rexmit_sent += sscp_retransmit_gap(ss, ack, sack, 1);
-        }
-    }
+    rexmit_sent = sscp_handle_sack(ss, sb_ack);
 
     // New data ACKed
     if (SEQ_GT(ss->snd_una, old_una)) {
@@ -1243,23 +1406,14 @@ static void sscp_process_ack(struct sscp_stream *ss,
         goto out;
     }
 
-    // No new ACK: dupACK path 
+    // No new ACK: dupACK path
     if (SEQ_LT(ss->snd_una, ss->snd_nxt)) {
         if (ss->dup_acks < UINT8_MAX)
             ss->dup_acks++;
 
         if (ss->dup_acks >= 3 && !ss->fr_active) {
             sscp_enter_recovery(ss);
-
-            if (sscp_sack_gap_valid(ss, ack, sack)) {
-                rexmit_sent += sscp_retransmit_gap(ss, ack, sack, RETRANS_GAP_MAX);
-
-                ss->last_gap_rexmit_ack = ack;
-                ss->last_gap_rexmit_valid = 1;
-            }else {
-                rexmit_sent += sscp_retransmit(ss);
-            }
-
+            rexmit_sent += sscp_retransmit(ss);
             ss->dup_acks = 0;
         }
     }
@@ -1287,31 +1441,41 @@ out:
  */
 void sscp_output_ack(struct sscp_stream *ss, struct sscp_hdr *data_sh)
 {
-    struct sscp_hdr sh;
-    memset(&sh, 0, sizeof(sh));
+    uint8_t pkt[sizeof(struct sscp_hdr) + sizeof(struct sscp_sack_ext) +
+                SSCP_SACK_MAX_WORDS * sizeof(uint32_t)];
+    struct sscp_hdr *sh;
+    uint16_t ext_len;
+    size_t total_len;
 
-    sh.seq = htonl(ss->snd_nxt);
-    sh.ack = htonl(ss->rcv_nxt);
-    sh.sack = htonl(sscp_calc_sack(ss));
-    sh.wnd   = htonl(ss->rcv_wnd);
-    sh.len   = 0;
-    sh.flags = SSCP_FLAG_ACK;
-    sh.fd    = ss->dst_fd;
+    sh = (struct sscp_hdr *)pkt;
+    memset(sh, 0, sizeof(*sh));
+
+    sh->seq = htonl(ss->snd_nxt);
+    sh->ack = htonl(ss->rcv_nxt);
+    sh->wnd = htonl(ss->rcv_wnd);
+    sh->flags = SSCP_FLAG_ACK;
+    sh->fd = ss->dst_fd;
     if (data_sh && data_sh->time_val) {
-        sh.time_val = data_sh->time_val;
+        sh->time_val = data_sh->time_val;
     } else if (ss->ack_echo_time) {
-        sh.time_val = ss->ack_echo_time;
+        sh->time_val = ss->ack_echo_time;
     }
     ss->ack_pending = 0;
     ss->ack_echo_time = 0;
     sscp_timer_delete(&ss->t_ack);
 
-    sh.cksum = 0;
-    sh.cksum = in_checksum(&sh, sizeof(struct sscp_hdr));
+    ext_len = sscp_sack_build(ss, pkt + sizeof(*sh));
+    if (ext_len > 0) {
+        sh->flags |= SSCP_FLAG_SACK;
+        sh->len = htons(ext_len);
+    }
 
-    sscp_debug_dump_tx("ACK", &sh, sizeof(struct sscp_hdr));
-    sscp_dump_hdr(ss, "ACK", &sh);
-    ss->st_class->send(ss->st_class->user, &sh, sizeof(struct sscp_hdr));
+    total_len = sizeof(*sh) + ext_len;
+    sh->cksum = sscp_checksum(pkt, total_len);
+
+    sscp_debug_dump_tx("ACK", pkt, total_len);
+    sscp_dump_hdr(ss, "ACK", sh);
+    ss->st_class->send(ss->st_class->user, pkt, total_len);
 }
 
 /* Build a transmit-ready packet for this fragment.
@@ -1323,17 +1487,17 @@ void sscp_output_data(struct sscp_stream *ss, struct sscp_buf *sb)
 {
     struct sscp_hdr *hdr = (struct sscp_hdr *)sb->data;
 
-    hdr->seq   = htonl(sb->seq);
-    hdr->ack   = htonl(ss->rcv_nxt);
-    hdr->sack  = htonl(sscp_calc_sack(ss));
-    hdr->wnd   = htonl(ss->rcv_wnd);
-    hdr->len   = htons((uint16_t)sb->len - sizeof(struct sscp_hdr));
-    hdr->flags = SSCP_FLAG_DATA;
-    hdr->fd    = ss->dst_fd;
-    hdr->time_val  = htonl(sscp_now_time());
+    hdr->seq    = htonl(sb->seq);
+    hdr->ack    = htonl(ss->rcv_nxt);
+    hdr->pkt_id = htonl(sb->pkt_id);
+    hdr->wnd    = htonl(ss->rcv_wnd);
+    hdr->len    = htons((uint16_t)(sb->len - sizeof(struct sscp_hdr)));
+    hdr->flags  = SSCP_FLAG_DATA;
+    hdr->fd     = ss->dst_fd;
+    hdr->time_val = htonl(sscp_now_time());
 
     hdr->cksum = 0;
-    hdr->cksum = in_checksum(sb->data, sb->len);
+    hdr->cksum = sscp_checksum(sb->data, sb->len);
 
     sscp_debug_dump_tx("DATA", sb->data, sb->len);
     sscp_dump_hdr(ss, "DATA", hdr);
@@ -1436,19 +1600,21 @@ static void sscp_pacing_arm_timer(struct sscp_stream *ss)
 
 static int sscp_output(struct sscp_stream *ss)
 {
-    uint32_t flight;
-    uint32_t win;
+    uint32_t raw_flight;
+    uint32_t pipe;
+    uint32_t avail;
 
     if (!ss->schedule_next)
         return 0;
 
-    win = min(ss->snd_wnd, ss->cwnd);
-    flight = ss->schedule_next->seq - ss->snd_una;
+    raw_flight = ss->schedule_next->seq - ss->snd_una;
+    pipe = raw_flight > ss->sacked_bytes ? (raw_flight - ss->sacked_bytes) : 0;
 
-    if (win == 0 || flight >= win)
+    if (ss->snd_wnd <= raw_flight || ss->cwnd <= pipe)
         return 0;
 
-    sscp_output_to_pacing(ss, win - flight);
+    avail = min(ss->snd_wnd - raw_flight, ss->cwnd - pipe);
+    sscp_output_to_pacing(ss, avail);
     sscp_pacing_send_due(ss);
 
     sscp_pacing_arm_timer(ss);
@@ -1534,6 +1700,9 @@ int sscp_connect(int fd)
     ss->snd_seq_q  = ss->iss;
     ss->snd_una  = ss->iss;
     ss->snd_nxt = ss->iss;
+    ss->snd_pkt_seq = 0;
+    ss->rcv_pkt_nxt = 1U;
+    ss->sacked_bytes = 0;
 
     ss->state = SSCP_SYN_SENT;
     ss->retry = 0;
@@ -1605,6 +1774,7 @@ int sscp_send(int fd, void *buf, size_t len)
     while (!list_empty(&pending)) {
         struct sscp_buf *sb = container_of(pending.next, struct sscp_buf, list);
         list_remove(&sb->list);
+        sb->pkt_id = ++ss->snd_pkt_seq;
         queue_enqueue(&ss->snd_q, &sb->list);
         ss->snd_q_count++;
 
@@ -1634,11 +1804,14 @@ static void sscp_listen_like_process(struct sscp_stream *ss,
 
         ss->irs     = ntohl(sh->seq);
         ss->rcv_nxt = ss->irs;
+        ss->rcv_pkt_nxt = 1U;
 
         ss->iss      = random32();
         ss->snd_seq_q  = ss->iss;
         ss->snd_una  = ss->iss;
         ss->snd_nxt = ss->iss;
+        ss->snd_pkt_seq = 0;
+        ss->sacked_bytes = 0;
 
         sscp_output_connect_ack(ss);
 
@@ -1669,6 +1842,7 @@ static void sscp_syn_sent_process(struct sscp_stream *ss,
 
         ss->irs = ntohl(sh->seq);
         ss->rcv_nxt = ss->irs;
+        ss->rcv_pkt_nxt = 1U;
 
         sscp_output_ack(ss, NULL);
 
@@ -1723,8 +1897,7 @@ static void sscp_syn_recv_process(struct sscp_stream *ss,
 static void sscp_est_process(struct sscp_stream *ss,
                             struct sscp_buf *sb,
                             uint32_t ack,
-                            uint32_t wnd,
-                            uint32_t sack)
+                            uint32_t wnd)
 {
     struct sscp_hdr *sh = (struct sscp_hdr *)sb->data;
     if (sh->flags == SSCP_FLAG_CONNECT_ACK) {
@@ -1736,14 +1909,15 @@ static void sscp_est_process(struct sscp_stream *ss,
     }
     if (sh->flags & SSCP_FLAG_ACK) {
         /*
-         * Only a pure ACK carries an echoed DATA timestamp.
+         * Only a pure ACK (with or without optional SACK) carries an echoed
+         * DATA timestamp.
          *
          * FIN|ACK and other control packets do not carry an RTT echo.
          * Reading their time_val would interpret an unrelated or
          * uninitialized value as a send timestamp and could make the
          * unsigned subtraction wrap to a value near UINT32_MAX.
          */
-        if (sh->flags == SSCP_FLAG_ACK) {
+        if ((sh->flags & ~SSCP_FLAG_SACK) == SSCP_FLAG_ACK) {
             uint32_t time_val = ntohl(sh->time_val);
 
             if (time_val) {
@@ -1758,7 +1932,7 @@ static void sscp_est_process(struct sscp_stream *ss,
             }
         }
 
-        sscp_process_ack(ss, ack, wnd, sack);
+        sscp_process_ack(ss, sb, ack, wnd);
     }
 
     if (sh->flags & SSCP_FLAG_DATA) {
@@ -1794,12 +1968,11 @@ static void sscp_est_process(struct sscp_stream *ss,
 static void sscp_fin_wait_process(struct sscp_stream *ss,
                                  struct sscp_buf *sb,
                                  uint32_t ack,
-                                 uint32_t wnd,
-                                 uint32_t sack)
+                                 uint32_t wnd)
 {
     struct sscp_hdr *sh = (struct sscp_hdr *)sb->data;
     if (sh->flags & SSCP_FLAG_ACK) {
-        sscp_process_ack(ss, ack, wnd, sack);
+        sscp_process_ack(ss, sb, ack, wnd);
     }
 
     if (sh->flags & SSCP_FLAG_PING) {
@@ -1833,8 +2006,7 @@ static void sscp_fin_wait_process(struct sscp_stream *ss,
 static void sscp_last_ack_process(struct sscp_stream *ss,
                                  struct sscp_buf *sb,
                                  uint32_t ack,
-                                 uint32_t wnd,
-                                 uint32_t sack)
+                                 uint32_t wnd)
 {
     struct sscp_hdr *sh = (struct sscp_hdr *)sb->data;
     if (sh->flags & SSCP_FLAG_PING) {
@@ -1879,12 +2051,11 @@ int sscp_input(void *ctx, void *buf, size_t len)
     if (ntohs(sh->len) != len - sizeof(struct sscp_hdr))
         return SSCP_ERR_GENERIC;
 
-    uint16_t calc = in_checksum(buf, len);
+    uint16_t calc = sscp_checksum(buf, len);
     if (calc != 0) return -1;
 
     uint32_t ack = ntohl(sh->ack);
     uint32_t wnd = ntohl(sh->wnd);
-    uint32_t sack = ntohl(sh->sack);
 
     ss = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)sh->fd);
     if (!ss) return -1;
@@ -1915,13 +2086,13 @@ int sscp_input(void *ctx, void *buf, size_t len)
         sscp_syn_recv_process(ss, sb, ack, wnd);
         break;
     case SSCP_ESTABLISHED:
-        sscp_est_process(ss, sb, ack, wnd, sack);
+        sscp_est_process(ss, sb, ack, wnd);
         break;
     case SSCP_FIN_WAIT:
-        sscp_fin_wait_process(ss, sb, ack, wnd, sack);
+        sscp_fin_wait_process(ss, sb, ack, wnd);
         break;
     case SSCP_LAST_ACK:
-        sscp_last_ack_process(ss, sb, ack, wnd, sack);
+        sscp_last_ack_process(ss, sb, ack, wnd);
         break;
     default:
         sscp_buf_free(ss, sb);

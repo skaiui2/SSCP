@@ -52,9 +52,21 @@ static int g_rexdrop_pre_rto_rexmits;
 /* Test C: unit test packet counter */
 static int g_unit_tx_count;
 
+/* Test D: scattered multi-hole SACK across > 128 packets */
+#define MULTI_DROP_COUNT 8
+static const uint32_t g_multi_drop_targets[MULTI_DROP_COUNT] = {
+    40U, 55U, 75U, 100U, 130U, 165U, 200U, 235U
+};
+static uint32_t g_multi_tx_pkts;
+static uint32_t g_multi_drop_seqs[MULTI_DROP_COUNT];
+static int g_multi_dropped;
+static uint64_t g_data_sack_flag;
+static uint64_t g_plain_ack_30b;
+static uint64_t g_sack_ack_pkts;
+
 static void count_timeout(struct sscp_stream *ss)
 {
-    unsigned idx = (ss->src_fd == 1 || ss->src_fd == 3) ? 0U : 1U;
+    unsigned idx = (ss->src_fd == 1 || ss->src_fd == 3 || ss->src_fd == 7) ? 0U : 1U;
     ++g_timeouts[idx];
     g_orig_timeout[idx](ss);
 }
@@ -64,20 +76,34 @@ static void observe_recovery(unsigned direction, int event, const void *buf, siz
     const struct sscp_hdr *h = buf;
     uint32_t seq, bytes;
     (void)now;
-    if (event != VNET_SEND || len < sizeof(*h) || !(h->flags & SSCP_FLAG_DATA))
+    if (event != VNET_SEND || len < sizeof(*h))
         return;
 
-    bytes = ntohs(h->len);
-    seq = ntohl(h->seq);
-    if (!g_data_seen[direction]) {
-        g_highest_seq[direction] = seq + bytes;
-        g_data_seen[direction] = 1;
+    if (h->flags & SSCP_FLAG_DATA) {
+        if (h->flags & SSCP_FLAG_SACK)
+            ++g_data_sack_flag;
+        bytes = ntohs(h->len);
+        seq = ntohl(h->seq);
+        if (!g_data_seen[direction]) {
+            g_highest_seq[direction] = seq + bytes;
+            g_data_seen[direction] = 1;
+            return;
+        }
+        if (SEQ_LT(seq, g_highest_seq[direction])) {
+            ++g_retrans_packets;
+        } else {
+            g_highest_seq[direction] = seq + bytes;
+        }
         return;
     }
-    if (SEQ_LT(seq, g_highest_seq[direction])) {
-        ++g_retrans_packets;
-    } else {
-        g_highest_seq[direction] = seq + bytes;
+
+    if ((h->flags & SSCP_FLAG_ACK) && !(h->flags & SSCP_FLAG_FIN)) {
+        if (h->flags & SSCP_FLAG_SACK) {
+            if (len > sizeof(*h))
+                ++g_sack_ack_pkts;
+        } else if (len == sizeof(*h)) {
+            ++g_plain_ack_30b;
+        }
     }
 }
 
@@ -115,6 +141,18 @@ static int send_a_filtered(void *user, const void *buf, size_t len)
                     return (int)len;
                 }
             }
+        } else if (g_test_mode == 4) {
+            int i;
+            for (i = 0; i < g_multi_dropped; ++i) {
+                if (g_multi_drop_seqs[i] == seq)
+                    return vnet_send(user, buf, len);
+            }
+            ++g_multi_tx_pkts;
+            if (g_multi_dropped < MULTI_DROP_COUNT &&
+                g_multi_tx_pkts == g_multi_drop_targets[g_multi_dropped]) {
+                g_multi_drop_seqs[g_multi_dropped++] = seq;
+                return (int)len;
+            }
         }
     }
     return vnet_send(user, buf, len);
@@ -146,6 +184,12 @@ static void reset_counters(int mode)
     g_rexdrop_target_tx = 0;
     g_rexdrop_pre_rto_rexmits = 0;
     g_unit_tx_count = 0;
+    g_multi_tx_pkts = 0;
+    g_multi_dropped = 0;
+    memset(g_multi_drop_seqs, 0, sizeof(g_multi_drop_seqs));
+    g_data_sack_flag = 0;
+    g_plain_ack_30b = 0;
+    g_sack_ack_pkts = 0;
 }
 
 static int check_clean_state(const char *tag)
@@ -252,16 +296,41 @@ static int run_dropped_rexmit_test(void)
     return ok && check_clean_state("TestB");
 }
 
+static void build_unit_sack_ack(struct sscp_buf *sb,
+                                uint8_t *raw,
+                                uint32_t base_id,
+                                uint32_t map0)
+{
+    struct sscp_hdr *sh = (struct sscp_hdr *)raw;
+    struct sscp_sack_ext ext;
+    uint32_t w0 = htonl(map0);
+    uint16_t ext_len = (uint16_t)(sizeof(ext) + sizeof(w0));
+
+    memset(sb, 0, sizeof(*sb));
+    memset(sh, 0, sizeof(*sh));
+    sh->flags = SSCP_FLAG_ACK | SSCP_FLAG_SACK;
+    sh->len = htons(ext_len);
+    ext.base_id = htonl(base_id);
+    ext.map_words = htons(1U);
+    memcpy(raw + sizeof(*sh), &ext, sizeof(ext));
+    memcpy(raw + sizeof(*sh) + sizeof(ext), &w0, sizeof(w0));
+    sb->data = raw;
+    sb->len = sizeof(*sh) + ext_len;
+}
+
 static int run_unit_timer_guard_test(void)
 {
     struct sscp_transport_class tc = {.send = unit_send, .user = NULL};
     struct sscp_stream *ss;
     unsigned char payload[4 * MSS];
+    uint8_t sack_raw[sizeof(struct sscp_hdr) + sizeof(struct sscp_sack_ext) + 4];
+    struct sscp_buf sack_buf;
     struct list_node *n;
     uint32_t expire0;
     uint32_t una;
     int i, ok;
 
+    assert(sizeof(struct sscp_hdr) == 30U);
     reset_counters(3);
     vnet_init(10, 100, 0, 3);
     ss = sscp_stream_alloc(&tc, 5, 6);
@@ -293,26 +362,29 @@ static int run_unit_timer_guard_test(void)
         sb->retransmitted = 1;
     }
     ss->fr_active = 0;
-    ss->last_gap_rexmit_valid = 0;
     ss->dup_acks = 0;
+
+    /* Packet #3 (idx 2 from base_id=1) is SACKed; packets #1 and #2 are missing. */
+    build_unit_sack_ack(&sack_buf, sack_raw, 1U, 1U << 2);
 
     for (i = 0; i < 20 * (int)SSCP_TICK_SCALE; ++i)
         assert(vnet_step() == 0);
 
-    /* Case 1: new_gap over [una, una + 2*MSS) where all segments are already retransmitted -> 0 sent, no timer reset. */
-    sscp_process_ack(ss, una, 65535U, una + 2U * MSS);
+    /* Case 1: SACK over hole where all segments are already retransmitted -> 0 sent, no timer reset. */
+    sscp_process_ack(ss, &sack_buf, una, 65535U);
     assert(g_unit_tx_count == 0);
     assert(ss->fr_active == 1);
+    assert(ss->sacked_bytes == MSS);
     assert(ss->t_retrans.active);
     assert(ss->t_retrans.expire == expire0);
 
-    /* Case 2: dupACK train while fr_active == 1 does not re-enter even with un-retransmitted segments. */
+    /* Case 2: plain dupACK train while fr_active == 1 does not re-enter even with un-retransmitted segments. */
     for (n = ss->snd_q.next; n != &ss->snd_q; n = n->next) {
         struct sscp_buf *sb = container_of(n, struct sscp_buf, list);
         sb->retransmitted = 0;
     }
     for (i = 0; i < 6; ++i)
-        sscp_process_ack(ss, una, 65535U, una);
+        sscp_process_ack(ss, NULL, una, 65535U);
     assert(g_unit_tx_count == 0);
     assert(ss->t_retrans.expire == expire0);
 
@@ -324,7 +396,7 @@ static int run_unit_timer_guard_test(void)
     ss->fr_active = 0;
     ss->dup_acks = 0;
     for (i = 0; i < 3; ++i)
-        sscp_process_ack(ss, una, 65535U, una + 2U * MSS);
+        sscp_process_ack(ss, &sack_buf, una, 65535U);
     assert(g_unit_tx_count == 0);
     assert(ss->t_retrans.expire == expire0);
 
@@ -332,7 +404,7 @@ static int run_unit_timer_guard_test(void)
     ss->fr_active = 0;
     ss->dup_acks = 0;
     for (i = 0; i < 3; ++i)
-        sscp_process_ack(ss, una, 65535U, una);
+        sscp_process_ack(ss, NULL, una, 65535U);
     assert(g_unit_tx_count == 1);
     assert(ss->t_retrans.active);
     assert(SEQ_GT(ss->t_retrans.expire, expire0));
@@ -345,6 +417,68 @@ static int run_unit_timer_guard_test(void)
     return ok;
 }
 
+static int run_multi_hole_sack_test(void)
+{
+    const uint64_t total = 1048576;
+    struct vnet_endpoint ea = {0}, eb = {1};
+    struct sscp_transport_class ta = {.send = send_a_filtered, .user = &ea};
+    struct sscp_transport_class tb = {.send = vnet_send, .user = &eb};
+    uint64_t steps = 0;
+    uint32_t max_sacked = 0;
+    uint32_t last_sacked = 0;
+    int ok = 0;
+
+    reset_counters(4);
+    vnet_init(25, 100, 0, 4);
+    vnet_observe(observe_recovery);
+    if (transfer_init(&g_b, &tb, 8, 7, 0, total, SSCP_CC_AIMD) ||
+        transfer_init(&g_a, &ta, 7, 8, 1, total, SSCP_CC_AIMD))
+        return 0;
+    vnet_attach(&g_a, &g_b);
+
+    g_orig_timeout[0] = g_a.stream->cc_on_timeout;
+    g_orig_timeout[1] = g_b.stream->cc_on_timeout;
+    g_a.stream->cc_on_timeout = count_timeout;
+    g_b.stream->cc_on_timeout = count_timeout;
+
+    while (steps < (uint64_t)60000U * SSCP_TICK_SCALE) {
+        struct sscp_stream *live_a;
+        ++steps;
+        if (vnet_step() || transfer_step(&g_a) || transfer_step(&g_b))
+            break;
+        live_a = hashmap_get(&sscp_stream_map, (void *)(uintptr_t)7);
+        if (live_a) {
+            last_sacked = live_a->sacked_bytes;
+            if (last_sacked > max_sacked)
+                max_sacked = last_sacked;
+        }
+        if (g_a.done && g_b.done) {
+            ok = 1;
+            break;
+        }
+    }
+
+    ok = ok && g_a.sent == total && g_b.received == total &&
+         g_a.hash == g_b.hash && g_a.peer_hash == g_a.hash &&
+         g_multi_dropped == MULTI_DROP_COUNT &&
+         g_retrans_packets == MULTI_DROP_COUNT &&
+         g_timeouts[0] == 0 && g_timeouts[1] == 0 &&
+         max_sacked > 0 && last_sacked == 0 &&
+         g_data_sack_flag == 0 &&
+         g_plain_ack_30b > 0 &&
+         g_sack_ack_pkts > 0;
+
+    printf("TestD(multi_hole_sack): ok=%d dropped=%d retrans=%" PRIu64 " timeouts=%" PRIu64 "/%" PRIu64
+           " max_sacked=%u end_sacked=%u plain_ack=%" PRIu64 " sack_ack=%" PRIu64 "\n",
+           ok, g_multi_dropped, g_retrans_packets, g_timeouts[0], g_timeouts[1],
+           max_sacked, last_sacked, g_plain_ack_30b, g_sack_ack_pkts);
+
+    transfer_cleanup(&g_a);
+    transfer_cleanup(&g_b);
+    vnet_free();
+    return ok && check_clean_state("TestD");
+}
+
 int main(void)
 {
     int ok = 1;
@@ -354,6 +488,7 @@ int main(void)
     if (!run_burst_drop_test()) ok = 0;
     if (!run_dropped_rexmit_test()) ok = 0;
     if (!run_unit_timer_guard_test()) ok = 0;
+    if (!run_multi_hole_sack_test()) ok = 0;
 
     printf("case_recovery: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

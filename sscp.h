@@ -42,6 +42,7 @@ struct sscp_timer {
 #define SSCP_RTO_MAX (2000U * (SSCP_TICK_SCALE))
 #define RETRANS_RECO_MAX 1
 #define RETRANS_GAP_MAX  4
+#define SSCP_SACK_MAX_WORDS 64U
 #ifndef SSCP_IW_SEGS
 #define SSCP_IW_SEGS     10U
 #endif
@@ -90,10 +91,12 @@ struct sscp_buf {
     };
     size_t len;
     uint32_t seq; // save it from hdr.
+    uint32_t pkt_id;
     uint64_t sent_time; // planned pacing send time, Q32.32 ticks
     uint64_t pacing_work_q32; // predicted next-RTT pacing work, Q32.32
     uint8_t dir:1;
     uint8_t retransmitted:1;
+    uint8_t sacked:1;
     uint8_t *data;
     uint32_t payload_off;
 };
@@ -101,13 +104,18 @@ struct sscp_buf {
 struct sscp_hdr {
     uint32_t seq;
     uint32_t ack;
-    uint32_t sack; //first hollow
+    uint32_t pkt_id;
     uint32_t fd;
     uint32_t wnd;
     uint16_t len;
     uint16_t cksum;
     uint16_t flags;
     uint32_t time_val;
+} __attribute__((packed));
+
+struct sscp_sack_ext {
+    uint32_t base_id;
+    uint16_t map_words;
 } __attribute__((packed));
 
 #define SSCP_FLAG_DATA  0x01
@@ -118,6 +126,7 @@ struct sscp_hdr {
 #define SSCP_FLAG_RESEND 0x20
 #define SSCP_FLAG_CONNECT_ACK 0x40
 #define SSCP_FLAG_FIN         0x80
+#define SSCP_FLAG_SACK        0x100
 
 #define SSCP_DIR_INPUT 1
 #define SSCP_DIR_SEND 0
@@ -166,9 +175,11 @@ struct sscp_stream {
     uint32_t snd_seq_q;                 // next seq to enqueue
     uint32_t snd_nxt;                   // highest seq ever sent
     uint32_t snd_wnd;                   // peer's advertised window
+    uint32_t snd_pkt_seq;               // last assigned DATA packet id
 
     uint32_t rcv_nxt;                   // next seq we expect
     uint32_t rcv_wnd;                   // our advertised window
+    uint32_t rcv_pkt_nxt;               // next in-order DATA packet id expected
 
     uint32_t snd_wmem;                  // send buffer watermark
     uint32_t rcv_wmem;                  // recv buffer watermark
@@ -214,8 +225,7 @@ struct sscp_stream {
     uint8_t dup_acks;                   // duplicate ACK counter
 
     uint8_t fr_active;
-    uint32_t last_gap_rexmit_ack;
-    uint8_t  last_gap_rexmit_valid : 1;
+    uint32_t sacked_bytes;
 
     uint32_t sent_cnt;
     uint32_t loss_cnt;
