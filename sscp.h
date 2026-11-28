@@ -167,6 +167,7 @@ struct sscp_stream {
     struct sscp_timer t_ack;             // delayed/batched ACK timer
     uint16_t ack_pending;
     uint32_t ack_echo_time;
+    uint32_t ack_recv_time;
 
     uint32_t dst_fd;                    // remote endpoint id
     uint32_t src_fd;                    // local endpoint id

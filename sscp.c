@@ -389,8 +389,22 @@ static void sscp_timer_retrans_cb(void *arg)
 static void sscp_timer_ack_cb(void *arg)
 {
     struct sscp_stream *ss = arg;
+    struct sscp_hdr delayed_sh;
+    uint32_t hold;
+
     if (!ss || ss->state == SSCP_CLOSED || ss->ack_pending == 0)
         return;
+
+    if (ss->ack_echo_time) {
+        hold = sscp_now_time() - ss->ack_recv_time;
+        if (hold > SSCP_ACK_DELAY_MS)
+            hold = SSCP_ACK_DELAY_MS;
+        memset(&delayed_sh, 0, sizeof(delayed_sh));
+        delayed_sh.time_val = htonl(ntohl(ss->ack_echo_time) + hold);
+        sscp_output_ack(ss, &delayed_sh);
+        return;
+    }
+
     sscp_output_ack(ss, NULL);
 }
 
@@ -414,8 +428,10 @@ static void sscp_schedule_ack(struct sscp_stream *ss,
                               struct sscp_hdr *data_sh,
                               int immediate)
 {
-    if (data_sh && data_sh->time_val)
+    if (data_sh && data_sh->time_val) {
         ss->ack_echo_time = data_sh->time_val;
+        ss->ack_recv_time = sscp_now_time();
+    }
     if (ss->ack_pending < UINT16_MAX)
         ss->ack_pending++;
     if (immediate || ss->fr_active || ss->rcv_buf_q.rb_node != NULL ||
@@ -1472,13 +1488,11 @@ void sscp_output_ack(struct sscp_stream *ss, struct sscp_hdr *data_sh)
     sh->wnd = htonl(ss->rcv_wnd);
     sh->flags = SSCP_FLAG_ACK;
     sh->fd = ss->dst_fd;
-    if (data_sh && data_sh->time_val) {
+    if (data_sh && data_sh->time_val)
         sh->time_val = data_sh->time_val;
-    } else if (ss->ack_echo_time) {
-        sh->time_val = ss->ack_echo_time;
-    }
     ss->ack_pending = 0;
     ss->ack_echo_time = 0;
+    ss->ack_recv_time = 0;
     sscp_timer_delete(&ss->t_ack);
 
     ext_len = sscp_sack_build(ss, pkt + sizeof(*sh));
@@ -1938,10 +1952,8 @@ static void sscp_est_process(struct sscp_stream *ss,
             uint32_t time_val = ntohl(sh->time_val);
 
             if (time_val) {
-                uint32_t sample = sscp_now_time() - time_val;
-
-                if (!sample)
-                    sample = 1;
+                uint32_t now = sscp_now_time();
+                uint32_t sample = SEQ_GT(now, time_val) ? (now - time_val) : 1U;
 
                 ss->rtt_sample = sample;
                 sscp_update_rtt_base(ss);
