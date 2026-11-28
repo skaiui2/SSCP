@@ -368,6 +368,34 @@ static void sscp_timer_retrans_cb(void *arg)
 
 }
 
+static void sscp_timer_ack_cb(void *arg)
+{
+    struct sscp_stream *ss = arg;
+    if (!ss || ss->state == SSCP_CLOSED || ss->ack_pending == 0)
+        return;
+    sscp_output_ack(ss, NULL);
+}
+
+static void sscp_schedule_ack(struct sscp_stream *ss,
+                              struct sscp_hdr *data_sh,
+                              int immediate)
+{
+    if (data_sh && data_sh->time_val)
+        ss->ack_echo_time = data_sh->time_val;
+    if (ss->ack_pending < UINT16_MAX)
+        ss->ack_pending++;
+    if (immediate || ss->ack_pending >= SSCP_ACK_BATCH_MAX) {
+        sscp_output_ack(ss, data_sh);
+        return;
+    }
+    if (!ss->t_ack.active) {
+        sscp_timer_create(&ss->t_ack,
+                          sscp_timer_ack_cb,
+                          ss,
+                          SSCP_ACK_DELAY_MS);
+    }
+}
+
 /*
  *In zero windows, we perisit remote.
  *If don't connect in a time, it is keeplive timer.
@@ -512,6 +540,7 @@ struct sscp_stream *sscp_stream_alloc(struct sscp_transport_class *st_class, int
     sscp_timer_node_init(&ss->t_hs);
     sscp_timer_node_init(&ss->t_fin);
     sscp_timer_node_init(&ss->t_pacing);
+    sscp_timer_node_init(&ss->t_ack);
 
     list_node_init(&ss->node);
     list_node_init(&ss->snd_q);
@@ -540,6 +569,7 @@ int sscp_stream_free(struct sscp_stream *ss)
     sscp_timer_remove(&ss->t_hs);
     sscp_timer_remove(&ss->t_fin);
     sscp_timer_remove(&ss->t_pacing);
+    sscp_timer_remove(&ss->t_ack);
 
     while (!list_empty(&ss->snd_q)) {
         struct sscp_buf *sb = container_of(ss->snd_q.next, struct sscp_buf, list);
@@ -917,6 +947,7 @@ static void sscp_process_data(struct sscp_stream *s, struct sscp_buf *sb)
         sscp_update_rcv_wnd(s);
 
         // consume any buffered contiguous out-of-order segments
+        int filled_hole = 0;
         for (;;) {
             struct rb_node *n = rb_first(&s->rcv_buf_q);
             if (!n)
@@ -934,9 +965,10 @@ static void sscp_process_data(struct sscp_stream *s, struct sscp_buf *sb)
             s->rcv_nxt += b_plen;
             s->sb_cc += b_plen;
             sscp_update_rcv_wnd(s);
+            filled_hole = 1;
         }
 
-        sscp_output_ack(s, sh);
+        sscp_schedule_ack(s, sh, filled_hole || payload_len < MSS);
         return;
     }
 
@@ -1267,7 +1299,12 @@ void sscp_output_ack(struct sscp_stream *ss, struct sscp_hdr *data_sh)
     sh.fd    = ss->dst_fd;
     if (data_sh && data_sh->time_val) {
         sh.time_val = data_sh->time_val;
+    } else if (ss->ack_echo_time) {
+        sh.time_val = ss->ack_echo_time;
     }
+    ss->ack_pending = 0;
+    ss->ack_echo_time = 0;
+    sscp_timer_delete(&ss->t_ack);
 
     sh.cksum = 0;
     sh.cksum = in_checksum(&sh, sizeof(struct sscp_hdr));

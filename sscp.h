@@ -45,6 +45,12 @@ struct sscp_timer {
 #ifndef SSCP_IW_SEGS
 #define SSCP_IW_SEGS     10U
 #endif
+#ifndef SSCP_ACK_BATCH_MAX
+#define SSCP_ACK_BATCH_MAX  8U
+#endif
+#ifndef SSCP_ACK_DELAY_MS
+#define SSCP_ACK_DELAY_MS   (15U * (SSCP_TICK_SCALE))
+#endif
 #ifndef SSCP_RECV_LIMIT
 #define SSCP_RECV_LIMIT (1 << 24)
 #endif
@@ -149,6 +155,9 @@ struct sscp_stream {
     struct sscp_timer t_hs;              // handshake retry timer
     struct sscp_timer t_fin;             // FIN retry timer
     struct sscp_timer t_pacing;          // pacing timer
+    struct sscp_timer t_ack;             // delayed/batched ACK timer
+    uint16_t ack_pending;
+    uint32_t ack_echo_time;
 
     uint32_t dst_fd;                    // remote endpoint id
     uint32_t src_fd;                    // local endpoint id
